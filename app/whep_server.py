@@ -7,7 +7,7 @@ from typing import Dict
 
 from aiohttp import web
 from pathlib import Path
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 
 from .media import build_tracks
@@ -75,9 +75,59 @@ class WhepServer:
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await self._cleanup(session_id)
 
-        # Add media tracks (NDI or synthetic). Use current selection.
+        # Add media track (NDI or synthetic) with codec preferences and encoding params
         bundle = build_tracks(ndi_source=self.ndi_source, ndi_url=self.ndi_source_url, ndi_exact=self.ndi_exact_name)
-        pc.addTrack(bundle.video)
+        # Create a transceiver so we can set codec preferences (e.g., prefer H264 over VP8)
+        transceiver = pc.addTransceiver("video", direction="sendonly")
+        try:
+            preferred = os.getenv("VIDEO_PREFERRED_CODEC", "H264").strip().lower()
+            caps = RTCRtpSender.getCapabilities("video").codecs
+            # Build a preference list: preferred codec first, then others
+            def pick(kind):
+                k = kind.lower()
+                sel = []
+                if k == "h264":
+                    # Prefer packetization-mode=1 profiles
+                    sel += [c for c in caps if c.mimeType.lower()=="video/h264" and "packetization-mode=1" in (c.parameters or "")]
+                    sel += [c for c in caps if c.mimeType.lower()=="video/h264" and "packetization-mode=1" not in (c.parameters or "")]
+                else:
+                    sel += [c for c in caps if c.mimeType.lower()==f"video/{k}"]
+                return sel
+            ordered = []
+            ordered += pick(preferred)
+            # Fallbacks
+            for alt in ("vp8", "h264", "vp9"):
+                if alt != preferred:
+                    ordered += [c for c in caps if c not in ordered and c.mimeType.lower()==f"video/{alt}"]
+            # Anything else
+            ordered += [c for c in caps if c not in ordered]
+            if ordered:
+                transceiver.setCodecPreferences(ordered)
+        except Exception:
+            pass
+        transceiver.sender.replaceTrack(bundle.video)
+        sender = transceiver.sender
+        # Optional encoder parameters to help performance
+        try:
+            params = sender.getParameters()
+            encs = params.encodings or [{}]
+            max_bitrate = os.getenv("VIDEO_MAX_BITRATE")
+            max_fps = os.getenv("VIDEO_MAX_FPS")
+            scale_down = os.getenv("VIDEO_SCALE_DOWN_BY")
+            for enc in encs:
+                if max_bitrate and max_bitrate.isdigit():
+                    enc["maxBitrate"] = int(max_bitrate)
+                if max_fps and max_fps.isdigit():
+                    enc["maxFramerate"] = float(max_fps)
+                if scale_down:
+                    try:
+                        enc["scaleResolutionDownBy"] = float(scale_down)
+                    except ValueError:
+                        pass
+            params.encodings = encs
+            sender.setParameters(params)
+        except Exception:
+            pass
         # audio is optional; not enabled by default
         # if bundle.audio:
         #     pc.addTrack(bundle.audio)
@@ -372,6 +422,7 @@ def create_web_app() -> web.Application:
     app.router.add_post("/ndi/select_url", server.handle_ndi_select_url)
     app.router.add_get("/health", server.handle_health)
     app.router.add_get("/healt", server.handle_health)
+    app.router.add_get("/frame", server.handle_frame_png)
     app.router.add_post("/whep", server.handle_whep_post)
     app.router.add_options("/whep", handle_options)
     app.router.add_patch("/whep/{session_id}", server.handle_whep_patch, name="whep_patch")
@@ -415,13 +466,17 @@ _INDEX_HTML = """
       <button id="play">Play</button>
       <button id="stop" disabled>Stop</button>
     </div>
-    <div class="row"><video id="v" playsinline autoplay muted></video></div>
+    <div class="row" style="position:relative; display:inline-block;">
+      <video id="v" playsinline autoplay muted></video>
+      <div id="hud" style="position:absolute;left:.5rem;top:.5rem;background:rgba(0,0,0,.5);color:#fff;padding:.2rem .4rem;border-radius:4px;font:12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">FPS: --</div>
+    </div>
     <div class="row"><pre id="log"></pre></div>
     <script>
       const log = (msg) => { document.getElementById('log').textContent += msg + "\n"; };
       let pc = null; let resource = null;
       const playBtn = document.getElementById('play');
       const stopBtn = document.getElementById('stop');
+      const hud = document.getElementById('hud');
       playBtn.onclick = async () => {
         const endpoint = document.getElementById('endpoint').value;
         pc = new RTCPeerConnection();
@@ -433,6 +488,22 @@ _INDEX_HTML = """
         resource = resp.headers.get('Location');
         const answerSdp = await resp.text();
         await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+        // Start FPS HUD if supported
+        const video = document.getElementById('v');
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+          let last = performance.now();
+          let frames = 0;
+          const loop = (now, meta)=>{
+            frames++;
+            if (now - last >= 1000){
+              const fps = (frames * 1000 / (now - last)).toFixed(1);
+              hud.textContent = `FPS: ${fps}`;
+              frames = 0; last = now;
+            }
+            if (video.srcObject) video.requestVideoFrameCallback(loop);
+          };
+          video.requestVideoFrameCallback(loop);
+        }
         playBtn.disabled = true; stopBtn.disabled = false;
       };
       stopBtn.onclick = async () => {

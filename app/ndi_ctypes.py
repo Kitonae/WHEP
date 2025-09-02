@@ -83,7 +83,11 @@ class NDIlib_recv_create_v3_t(ctypes.Structure):
 
 
 # Enums (values based on NDI SDK headers)
+NDIlib_recv_color_format_fastest = 0
+NDIlib_recv_color_format_UYVY_BGRA = 1
 NDIlib_recv_color_format_BGRX_BGRA = 2
+NDIlib_recv_color_format_RGBX_RGBA = 3
+NDIlib_recv_color_format_best = 4
 NDIlib_recv_bandwidth_highest = 2
 
 NDIlib_frame_type_none = 0
@@ -273,14 +277,47 @@ class NDI:
     def recv_create(self, source: NDIlib_source_t) -> c_void_p:
         cfg = NDIlib_recv_create_v3_t()
         cfg.source_to_connect_to = source
-        cfg.color_format = NDIlib_recv_color_format_BGRX_BGRA
+        # Allow override of requested color format via env for compatibility across SDKs/senders.
+        cfg.color_format = self._pick_color_format()
         cfg.bandwidth = NDIlib_recv_bandwidth_highest
         cfg.allow_video_fields = False
         cfg.p_ndi_recv_name = None
         h = self.lib.NDIlib_recv_create_v3(byref(cfg))
         if not h:
             raise NDIError("NDIlib_recv_create_v3() returned null")
+        try:
+            fmt_name = self._color_format_name(cfg.color_format)
+        except Exception:
+            fmt_name = str(cfg.color_format)
+        # Basic print to help diagnose color pipeline
+        print(f"NDI recv created with color_format={fmt_name}")
         return h
+
+    def _pick_color_format(self) -> int:
+        sel = (os.getenv("NDI_RECV_COLOR") or "").strip().upper()
+        # Common aliases map to NDI enum values. If unknown, keep legacy default BGRX_BGRA.
+        if sel in ("FAST", "FASTEST"):
+            return NDIlib_recv_color_format_fastest
+        if sel in ("BEST",):
+            return NDIlib_recv_color_format_best
+        if sel in ("UYVY", "UYVY_BGRA"):
+            return NDIlib_recv_color_format_UYVY_BGRA
+        if sel in ("BGRX", "BGRA", "BGRX_BGRA"):
+            return NDIlib_recv_color_format_BGRX_BGRA
+        if sel in ("RGBX", "RGBA", "RGBX_RGBA"):
+            return NDIlib_recv_color_format_RGBX_RGBA
+        # Default: prefer UYVY for broad compatibility and lower bandwidth
+        return NDIlib_recv_color_format_UYVY_BGRA
+
+    def _color_format_name(self, val: int) -> str:
+        mapping = {
+            NDIlib_recv_color_format_fastest: "FASTEST",
+            NDIlib_recv_color_format_UYVY_BGRA: "UYVY",
+            NDIlib_recv_color_format_BGRX_BGRA: "BGRX/BGRA",
+            NDIlib_recv_color_format_RGBX_RGBA: "RGBX/RGBA",
+            NDIlib_recv_color_format_best: "BEST",
+        }
+        return mapping.get(val, f"{val}")
 
     def recv_destroy(self, handle: c_void_p) -> None:
         if handle:

@@ -21,8 +21,9 @@
       button{padding:.5rem .9rem;border:1px solid var(--border);border-radius:6px;background:#182230;color:var(--fg);cursor:pointer}
       button:hover{border-color:var(--accent)}
       button:disabled{opacity:.6;cursor:not-allowed}
-      .player{grid-area:player}
+      .player{grid-area:player;position:relative}
       video{width:100%;max-width:1280px;aspect-ratio:16 / 9;background:#000;border-radius:8px;border:1px solid var(--border)}
+      .hud{position:absolute;left:.5rem;top:.5rem;background:rgba(0,0,0,.5);color:#e6edf3;padding:.2rem .4rem;border-radius:4px;font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
       .log{grid-area:log;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1rem}
       pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;color:#ccd6e3}
       code{background:#101820;padding:.1rem .25rem;border-radius:4px}
@@ -53,7 +54,10 @@
           <button id="stop" disabled>Stop</button>
         </div>
       </section>
-      <section class="player"><video id="video" playsinline></video></section>
+      <section class="player">
+        <video id="video" playsinline></video>
+        <div class="hud" id="hud-fps">FPS: --</div>
+      </section>
       <section class="log"><pre id="log"></pre></section>
     </main>
     <script>
@@ -64,6 +68,7 @@
         const iceParam = url.searchParams.get('ice');
         const logEl = qs('#log');
         const videoEl = qs('#video');
+        const hudFps = qs('#hud-fps');
         const endpointEl = qs('#endpoint');
         const iceEl = qs('#ice');
         const muteEl = qs('#mute');
@@ -99,6 +104,31 @@
             const answerSdp = await resp.text();
             await pc.setRemoteDescription({ type:'answer', sdp: answerSdp });
             log('Answer set. Streaming...');
+            // start FPS counter
+            if ('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+              let last = performance.now();
+              let frames = 0;
+              const loop = (now, meta)=>{
+                frames++;
+                if (now - last >= 1000){
+                  const fps = (frames * 1000 / (now - last)).toFixed(1);
+                  hudFps.textContent = `FPS: ${fps}`;
+                  frames = 0; last = now;
+                }
+                if (videoEl.srcObject) videoEl.requestVideoFrameCallback(loop);
+              };
+              videoEl.requestVideoFrameCallback(loop);
+            } else {
+              // Fallback: sample currentTime periodically
+              let lastT = 0, lastN = performance.now();
+              const timer = setInterval(()=>{
+                if (!videoEl.srcObject){ clearInterval(timer); return; }
+                const t = videoEl.currentTime, n = performance.now();
+                const dt = (n - lastN) / 1000; const dsec = t - lastT;
+                if (dt > 0){ hudFps.textContent = `FPS: ${(dsec/dt* (1/ (1))).toFixed(1)}`; }
+                lastT = t; lastN = n;
+              }, 1000);
+            }
             playBtn.disabled = true; stopBtn.disabled = false;
           }catch(err){
             log('Error: ' + (err && err.message || err));
@@ -115,4 +145,3 @@
     </script>
   </body>
   </html>
-

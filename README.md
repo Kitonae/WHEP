@@ -32,6 +32,15 @@ Environment Variables
 - `NDI_SOURCE`: Name of the NDI source to receive (enables NDI).
 - `ICE_SERVERS`: Comma-separated STUN/TURN URLs (e.g., `stun:stun.l.google.com:19302`).
 - `FPS`, `VIDEO_WIDTH`, `VIDEO_HEIGHT`: Synthetic source configuration.
+- `VIDEO_MAX_BITRATE`: Optional video encoder cap in bps (e.g., `1500000`).
+- `VIDEO_MAX_FPS`: Optional encoder max framerate (e.g., `30`).
+- `VIDEO_SCALE_DOWN_BY`: Optional downscale factor at the encoder (e.g., `2` to halve).
+- `VIDEO_PREFERRED_CODEC`: Preferred codec (`H264`, `VP8`, `VP9`), default `H264`.
+- `NDI_RECV_TIMEOUT_MS`: NDI capture poll timeout (default `50`).
+- `NDI_OUTPUT_PIXFMT`: Optional pre-conversion pixel format (e.g., `yuv420p`).
+- `NDI_RECV_COLOR`: Requested NDI receiver color format. Defaults to `UYVY` for broad compatibility.
+  - Options: `UYVY`, `BGRX`/`BGRA`, `RGBX`/`RGBA`, `FASTEST`, `BEST`.
+  - If unsure, keep default `UYVY`.
 - `PORT`, `HOST`: Server bind address.
 - `LOG_LEVEL`: Logging level (e.g., `INFO`, `DEBUG`).
 
@@ -42,6 +51,14 @@ NDI Integration
 - Discover available sources via HTTP: `GET /ndi/sources` → `{ "sources": ["name1", ...] }`.
 - Select a source by setting `NDI_SOURCE` to a substring of the NDI name (case-insensitive).
   - When selecting via API, the server stores a stable NDI URL for that source and uses it for new sessions.
+
+Color Formats and Troubleshooting
+
+- Default requested format is `UYVY` (YUV 4:2:2). The server converts to RGB internally.
+- If colors look wrong:
+  - Check logs for a line like: `NDI: first frame FourCC='...' ...`.
+  - For 4-channel inputs, set `NDI_INPUT_RGBA_ORDER` to one of `RGBA`, `BGRA`, `ARGB`, `ABGR`, `RGBX`, `BGRX`.
+  - For YUV422, you can force layout via `NDI_INPUT_YUV422_ORDER=UYVY|YUY2` and optionally `NDI_SWAP_UV=1`.
 
 Runtime control endpoints
 
