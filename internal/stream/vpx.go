@@ -13,6 +13,13 @@ package stream
 
 static vpx_codec_iface_t* vpx_iface() { return vpx_codec_vp8_cx(); }
 
+typedef struct frame_data {
+    void *buf;
+    size_t sz;
+    vpx_codec_pts_t pts;
+    unsigned long duration;
+    vpx_codec_frame_flags_t flags;
+} frame_data_t;
 */
 import "C"
 
@@ -117,12 +124,14 @@ func (e *VP8Encoder) EncodeI420(y, u, v []byte) (out [][]byte, keyframe bool, er
         pkt := C.vpx_codec_get_cx_data(&e.ctx, &iter)
         if pkt == nil { break }
         if pkt.kind != C.VPX_CODEC_CX_FRAME_PKT { continue }
-        f := (*C.vpx_codec_cx_pkt_t)(pkt)
-        frame := (*C.uchar)(f.data.frame.buf)
-        size := int(f.data.frame.sz)
-        goBytes := C.GoBytes(unsafe.Pointer(frame), C.int(size))
+        f := (*C.vpx_codec_cx_pkt_t)(unsafe.Pointer(pkt))
+        var frameData C.frame_data_t
+        // Copy the frame data struct to avoid direct union access
+        C.memcpy(unsafe.Pointer(&frameData), unsafe.Pointer(&f.data), C.size_t(unsafe.Sizeof(frameData)))
+        // Now we can safely access the frame data
+        goBytes := C.GoBytes(frameData.buf, C.int(frameData.sz))
         out = append(out, goBytes)
-        keyframe = keyframe || (f.data.frame.flags & C.VPX_FRAME_IS_KEY) != 0
+        keyframe = keyframe || (frameData.flags&C.VPX_FRAME_IS_KEY) != 0
     }
     return out, keyframe, nil
 }

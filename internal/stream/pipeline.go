@@ -16,10 +16,14 @@ import (
 type PipelineConfig struct {
     Width, Height int
     FPS           int
+    BitrateKbps   int // used by VP8 pipeline; ignored by H264
     Source        Source
     // Track expects a Pion track with WriteSample(media.Sample) (e.g., *webrtc.TrackLocalStaticSample).
     Track         interface{}
 }
+
+// optional capability: source can advertise its pixel format (e.g., "bgra", "uyvy422")
+type sourcePixFmt interface{ PixFmt() string }
 
 // Source produces raw BGRA frames of fixed size and FPS.
 type Source interface {
@@ -55,11 +59,37 @@ type Pipeline struct {
     quit  chan struct{}
 }
 
+// optional capability: some sources can report their last frame size
+type sourceWithLast interface{ Last() ([]byte,int,int,bool) }
+
 func (p *Pipeline) start() error {
-    // ffmpeg command: read raw BGRA from stdin, encode H264 veryfast zerolatency, output AnnexB to stdout
+    // If source can report dimensions, prefer those over configured width/height
+    if p.cfg.Source != nil {
+        if s, ok := p.cfg.Source.(sourceWithLast); ok {
+            // wait up to ~1s to get dimensions
+            deadline := time.Now().Add(1 * time.Second)
+            for time.Now().Before(deadline) {
+                if _, w, h, ok2 := s.Last(); ok2 && w > 0 && h > 0 {
+                    p.cfg.Width, p.cfg.Height = w, h
+                    break
+                }
+                time.Sleep(50 * time.Millisecond)
+            }
+        }
+    }
+
+    // pick input pixel format from source, fallback to bgra
+    pixfmt := "bgra"
+    if p.cfg.Source != nil {
+        if sp, ok := p.cfg.Source.(sourcePixFmt); ok {
+            if pf := sp.PixFmt(); pf != "" { pixfmt = pf }
+        }
+    }
+
+    // ffmpeg command: read raw video from stdin, encode H264 veryfast zerolatency, output AnnexB to stdout
     args := []string{
         "-f", "rawvideo",
-        "-pix_fmt", "bgra",
+        "-pix_fmt", pixfmt,
         "-s:v",  sizeArg(p.cfg.Width, p.cfg.Height),
         "-r",     itoa(p.cfg.FPS),
         "-i",     "-",
@@ -89,7 +119,11 @@ func (p *Pipeline) start() error {
             select { case <-p.quit: return; case <-ticker.C: }
             frame, ok := p.cfg.Source.Next()
             if !ok { return }
-            if len(frame) != p.cfg.Width*p.cfg.Height*4 { continue }
+            bpp := 4
+            if sp, ok := p.cfg.Source.(sourcePixFmt); ok {
+                if sp.PixFmt() == "uyvy422" { bpp = 2 }
+            }
+            if len(frame) != p.cfg.Width*p.cfg.Height*bpp { continue }
             if _, err := p.stdin.Write(frame); err != nil { return }
         }
     }()

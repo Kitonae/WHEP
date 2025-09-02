@@ -20,6 +20,7 @@ func main() {
     fps := flag.Int("fps", getEnvInt("FPS", 30), "synthetic fps if used")
     width := flag.Int("width", getEnvInt("VIDEO_WIDTH", 1280), "synthetic width")
     height := flag.Int("height", getEnvInt("VIDEO_HEIGHT", 720), "synthetic height")
+    bitrate := flag.Int("bitrate", getEnvInt("VIDEO_BITRATE_KBPS", 6000), "target video bitrate (kbps) for VP8")
     flag.Parse()
 
     cfg := server.Config{
@@ -28,6 +29,7 @@ func main() {
         FPS:    *fps,
         Width:  *width,
         Height: *height,
+        BitrateKbps: *bitrate,
     }
 
     mux := http.NewServeMux()

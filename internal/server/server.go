@@ -8,6 +8,10 @@ import (
     "os"
     "net/http"
     "sync"
+    "time"
+    "image"
+    "image/png"
+    "strconv"
 
     "github.com/google/uuid"
     "github.com/pion/webrtc/v3"
@@ -23,6 +27,7 @@ type Config struct {
     FPS    int
     Width  int
     Height int
+    BitrateKbps int
 }
 
 type WhepServer struct {
@@ -37,10 +42,13 @@ type WhepServer struct {
 type session struct {
     pc     *webrtc.PeerConnection
     sender *webrtc.RTPSender
+    track  interface{}
     stop   func()
 }
 
 func NewWhepServer(cfg Config) *WhepServer {
+    // Start background NDI discovery so API can serve cached results immediately
+    ndi.StartBackgroundDiscovery()
     return &WhepServer{cfg: cfg, sessions: map[string]*session{}}
 }
 
@@ -58,6 +66,7 @@ func (s *WhepServer) RegisterRoutes(mux *http.ServeMux) {
             "ndi": map[string]any{"selected": name, "url": url},
         })
     })
+    mux.HandleFunc("/frame", s.handleFramePNG)
     mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         io.WriteString(w, indexHTML)
     })
@@ -124,28 +133,55 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
             log.Printf("NDI source unavailable (%v), falling back to synthetic", err)
         }
     }
-    // Try libvpx VP8 pipeline first (if cgo/libvpx available); fallback to ffmpeg H.264.
+    // Start VP8 pipeline (no H.264 fallback)
     var stopper interface{ Stop() }
     pipeVP8, err := stream.StartVP8Pipeline(stream.PipelineConfig{
         Width:  s.cfg.Width,
         Height: s.cfg.Height,
         FPS:    fps,
+        BitrateKbps: s.cfg.BitrateKbps,
         Source: src,
         Track:  videoTrack,
     })
     if err != nil {
-        log.Printf("VP8 pipeline unavailable (%v), falling back to ffmpeg H.264", err)
-        pipeH264, err2 := stream.StartH264Pipeline(stream.PipelineConfig{
-            Width: s.cfg.Width, Height: s.cfg.Height, FPS: fps, Source: src, Track: videoTrack,
-        })
-        if err2 != nil {
-            _ = pc.Close()
-            http.Error(w, fmt.Sprintf("pipeline error: %v", err2), http.StatusInternalServerError)
-            return
+        _ = pc.Close()
+        http.Error(w, fmt.Sprintf("VP8 pipeline error: %v", err), http.StatusInternalServerError)
+        return
+    }
+    stopper = pipeVP8
+
+    // Monitor for source resolution changes and restart pipeline when needed
+    type sourceWithLast interface{ Last() ([]byte,int,int,bool) }
+    if src != nil {
+        if reporter, ok := src.(sourceWithLast); ok {
+            pipeMu := &sync.Mutex{}
+            currentW, currentH := s.cfg.Width, s.cfg.Height
+            go func() {
+                ticker := time.NewTicker(1 * time.Second)
+                defer ticker.Stop()
+                for range ticker.C {
+                    _, w0, h0, ok := reporter.Last()
+                    if !ok || w0 <= 0 || h0 <= 0 { continue }
+                    // Avoid restart if unchanged
+                    if w0 == currentW && h0 == currentH { continue }
+                    log.Printf("Pipeline: source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
+                    // Restart pipeline with new size
+                    pipeMu.Lock()
+                    if stopper != nil { stopper.Stop() }
+                    var newStop interface{ Stop() }
+                    p, err := stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                    newStop = p
+                    if err != nil {
+                        log.Printf("Pipeline: restart failed: %v", err)
+                        pipeMu.Unlock()
+                        continue
+                    }
+                    stopper = newStop
+                    currentW, currentH = w0, h0
+                    pipeMu.Unlock()
+                }
+            }()
         }
-        stopper = pipeH264
-    } else {
-        stopper = pipeVP8
     }
 
     // WHEP semantics: set remote offer, answer, and wait for ICE gather complete
@@ -170,7 +206,7 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     }
     <-gatherComplete
 
-    sess := &session{pc: pc, sender: sender, stop: stopper.Stop}
+    sess := &session{pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop}
     s.mu.Lock(); s.sessions[id] = sess; s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -192,7 +228,8 @@ func (s *WhepServer) handleNDISources(w http.ResponseWriter, r *http.Request) {
     allowCORS(w, r)
     if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
     type Info struct{ Name string `json:"name"`; URL string `json:"url"` }
-    srcs := streamNDISources()
+    // Serve from cache immediately for responsiveness
+    srcs := ndi.GetCachedSources()
     list := make([]Info, 0, len(srcs))
     for _, si := range srcs { list = append(list, Info{Name: si.Name, URL: si.URL}) }
     _ = json.NewEncoder(w).Encode(map[string]any{"sources": list})
@@ -221,7 +258,11 @@ func (s *WhepServer) handleNDISelect(w http.ResponseWriter, r *http.Request) {
     if selName == "" && len(srcs) > 0 { // fallback to first
         selName, selURL = srcs[0].Name, srcs[0].URL
     }
-    s.mu.Lock(); s.ndiName, s.ndiURL = selName, selURL; s.mu.Unlock()
+    s.mu.Lock(); s.ndiName, s.ndiURL = selName, selURL; sessions := make([]*session, 0, len(s.sessions)); for _, ss := range s.sessions { sessions = append(sessions, ss) } ; s.mu.Unlock()
+    // Restart pipelines for all active sessions to apply new source immediately
+    for _, ss := range sessions {
+        _ = s.restartSessionPipeline(ss)
+    }
     _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "selected": selName, "url": selURL})
 }
 
@@ -234,15 +275,19 @@ func (s *WhepServer) handleNDISelectURL(w http.ResponseWriter, r *http.Request) 
     if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.URL == "" {
         http.Error(w, "invalid JSON or missing 'url'", http.StatusBadRequest); return
     }
-    s.mu.Lock(); s.ndiURL = body.URL; s.mu.Unlock()
+    s.mu.Lock(); s.ndiURL = body.URL; sessions := make([]*session, 0, len(s.sessions)); for _, ss := range s.sessions { sessions = append(sessions, ss) } ; s.mu.Unlock()
+    // Restart pipelines for all active sessions to apply new source immediately
+    for _, ss := range sessions {
+        _ = s.restartSessionPipeline(ss)
+    }
     _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "url": body.URL})
 }
 
 // helper to get NDI discovery results via cgo wrapper; returns empty list when unavailable
 func streamNDISources() []struct{ Name, URL string } {
     out := []struct{ Name, URL string }{}
-    // Use the ndi package when available
-    for _, s := range ndi.ListSources(1000) {
+    // Use cached sources from background discovery
+    for _, s := range ndi.GetCachedSources() {
         out = append(out, struct{ Name, URL string }{Name: s.Name, URL: s.URL})
     }
     return out
@@ -268,12 +313,103 @@ func (s *WhepServer) handleWHEPResource(w http.ResponseWriter, r *http.Request) 
     }
 }
 
+// restartSessionPipeline stops the current encoder for the session and starts a new one
+// using the server's currently selected NDI source. It reuses the existing track.
+func (s *WhepServer) restartSessionPipeline(ss *session) error {
+    if ss == nil || ss.track == nil { return nil }
+    // Build source from current selection
+    s.mu.Lock(); ndiURL := s.ndiURL; ndiName := s.ndiName; s.mu.Unlock()
+    if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
+    if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
+    var src stream.Source
+    if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
+        src = nd
+    } else {
+        // fallback to synthetic if NDI unavailable
+        src = nil
+    }
+    // Restart VP8 pipeline only
+    fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
+    // Stop old
+    if ss.stop != nil { ss.stop() }
+    // Start new (auto-detect size inside pipeline)
+    if p, err := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); err == nil {
+        ss.stop = p.Stop
+    } else {
+        log.Printf("Pipeline restart error: %v", err)
+        return err
+    }
+    return nil
+}
+
 func (s *WhepServer) closeSession(id string) {
     s.mu.Lock(); sess := s.sessions[id]; delete(s.sessions, id); s.mu.Unlock()
     if sess != nil {
         if sess.stop != nil { sess.stop() }
         _ = sess.pc.Close()
         log.Printf("WHEP session %s: closed", id)
+    }
+}
+
+// handleFramePNG returns a single PNG frame from the currently selected NDI source.
+// Query param: timeout=ms (default 2000)
+func (s *WhepServer) handleFramePNG(w http.ResponseWriter, r *http.Request) {
+    allowCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+    if r.Method != http.MethodGet { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+
+    // Get timeout
+    timeoutMs := 2000
+    if t := r.URL.Query().Get("timeout"); t != "" {
+        if v, err := strconv.Atoi(t); err == nil && v > 0 { timeoutMs = v }
+    }
+    deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+
+    // Resolve selection
+    s.mu.Lock(); ndiURL := s.ndiURL; ndiName := s.ndiName; s.mu.Unlock()
+    if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
+    if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
+
+    // Create a temporary NDI source
+    nd, err := stream.NewNDISource(ndiURL, ndiName)
+    if err != nil {
+        http.Error(w, "NDI not available or source not found", http.StatusServiceUnavailable)
+        return
+    }
+    defer nd.Stop()
+
+    var buf []byte; var wpx,hpx int; var ok bool
+    for time.Now().Before(deadline) {
+        if b, w0, h0, have := nd.Last(); have && b != nil && len(b) >= w0*h0*4 && w0>0 && h0>0 {
+            buf, wpx, hpx, ok = b, w0, h0, true
+            break
+        }
+        time.Sleep(50 * time.Millisecond)
+    }
+    if !ok {
+        http.Error(w, "no frame available", http.StatusServiceUnavailable)
+        return
+    }
+
+    // Convert BGRA to RGBA and encode PNG
+    img := image.NewRGBA(image.Rect(0,0,wpx,hpx))
+    // RGBA stride is 4*wpx by default
+    for y := 0; y < hpx; y++ {
+        for x := 0; x < wpx; x++ {
+            si := (y*wpx + x) * 4
+            di := si
+            b := buf[si+0]; g := buf[si+1]; r := buf[si+2]; a := buf[si+3]
+            img.Pix[di+0] = r
+            img.Pix[di+1] = g
+            img.Pix[di+2] = b
+            img.Pix[di+3] = a
+        }
+    }
+
+    w.Header().Set("Content-Type", "image/png")
+    if err := png.Encode(w, img); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
     }
 }
 
