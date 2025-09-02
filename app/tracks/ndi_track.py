@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Optional, Tuple
 
 import ctypes
@@ -46,6 +47,9 @@ class NdivideoTrack(VideoStreamTrack):
             self._recv_timeout_ms = 50
         # Optional output pixel format to pre-convert (e.g., 'yuv420p')
         self._output_pix_fmt: Optional[str] = os.getenv("NDI_OUTPUT_PIXFMT") or None
+        # Lightweight profiling controls
+        self._prof_enabled = (os.getenv("NDI_PROF") or "").lower() in ("1", "true", "yes")
+        self._prof = {"n": 0, "conv": 0.0, "scale": 0.0, "total": 0.0, "dropped": 0}
 
     async def start(self):
         if self._ndi is not None:
@@ -112,10 +116,16 @@ class NdivideoTrack(VideoStreamTrack):
                     self._queue.put_nowait(f)
                 except Exception:
                     pass
+                try:
+                    if self._prof_enabled:
+                        self._prof["dropped"] += 1
+                except Exception:
+                    pass
 
         n = 0
         try:
             while self._running:
+                t_all0 = time.perf_counter()
                 vf = self._ndi.recv_capture_video(self._receiver, timeout_ms=max(1, self._recv_timeout_ms))
                 if vf is None:
                     continue
@@ -157,11 +167,15 @@ class NdivideoTrack(VideoStreamTrack):
                             "BGR0": "bgr0",
                         }
                         pixfmt = order_map.get(order, "rgba")
+                        t1 = time.perf_counter()
                         frame = VideoFrame.from_ndarray(frame_arr, format=pixfmt)
+                        t2 = time.perf_counter()
                     elif fourcc_str in ("UYVY", "2vuy", "YUY2", "YUYV"):
                         # 4:2:2 packed YUV. Convert directly to I420 (yuv420p) to reduce encoder work.
                         Y, U420, V420 = self._uyvy_to_i420_planes(row_view[:, : w * 2], w, h, fourcc_str)
+                        t1 = time.perf_counter()
                         frame = self._frame_from_i420_planes(Y, U420, V420)
+                        t2 = time.perf_counter()
                     else:
                         # If stride matches 2 bytes per pixel, treat as YUV422 (default UYVY unless overridden).
                         if stride >= w * 2 and stride < w * 4:
@@ -169,20 +183,26 @@ class NdivideoTrack(VideoStreamTrack):
                             if order not in ("UYVY", "YUY2", "YUYV", "2VUY"):
                                 order = "UYVY"
                             Y, U420, V420 = self._uyvy_to_i420_planes(row_view[:, : w * 2], w, h, order)
+                            t1 = time.perf_counter()
                             frame = self._frame_from_i420_planes(Y, U420, V420)
+                            t2 = time.perf_counter()
                             if n % 120 == 0:
                                 logger.warning("NDI: unknown FourCC '%s' (%d); inferred 2bpp -> %s conversion", fourcc_str, fourcc, order)
                         else:
                             # Fallback: assume 4-byte BGRA to avoid crashes; log once per few seconds.
                             trimmed = row_view[:, : w * 4].copy()
                             frame_arr = trimmed.reshape(h, w, 4)
+                            t1 = time.perf_counter()
                             frame = VideoFrame.from_ndarray(frame_arr, format="bgra")
+                            t2 = time.perf_counter()
                             if n % 120 == 0:
                                 logger.warning("NDI: unexpected FourCC '%s' (%d); assuming BGRA", fourcc_str, fourcc)
                     target_w = self.width or w
                     target_h = self.height or h
+                    t3 = time.perf_counter()
                     if target_w != w or target_h != h:
                         frame = frame.reformat(width=target_w, height=target_h)
+                    t4 = time.perf_counter()
                     if self._output_pix_fmt:
                         try:
                             frame = frame.reformat(format=self._output_pix_fmt)
@@ -194,6 +214,21 @@ class NdivideoTrack(VideoStreamTrack):
                     n += 1
                     if n % 120 == 0:
                         logger.debug("NDI: captured %d frames (%dx%d)", n, frame.width, frame.height)
+                    if self._prof_enabled:
+                        self._prof["n"] += 1
+                        self._prof["conv"] += (t2 - t1)
+                        self._prof["scale"] += (t4 - t3)
+                        self._prof["total"] += (time.perf_counter() - t_all0)
+                        if n % 120 == 0:
+                            nn = max(1, self._prof["n"])
+                            logger.info(
+                                "NDI PROF: frames=%d conv=%.2fms scale=%.2fms total=%.2fms drops=%d",
+                                nn,
+                                1000.0 * self._prof["conv"] / nn,
+                                1000.0 * self._prof["scale"] / nn,
+                                1000.0 * self._prof["total"] / nn,
+                                self._prof.get("dropped", 0),
+                            )
                 except Exception as e:
                     logger.exception("NDI capture loop error: %s", e)
                 finally:

@@ -42,6 +42,23 @@ Tip: For a synthetic “Splash” source while testing NDI flows, select the NDI
 
 Most flags also read from environment variables. See `/config` at runtime for a live view.
 
+- `NDI_SOURCE`: Name of the NDI source to receive (enables NDI)
+- `NDI_SOURCE_URL`: Explicit NDI URL (alternative to name)
+- `ICE_SERVERS`: Comma-separated STUN/TURN URLs (e.g., `stun:stun.l.google.com:19302`)
+- `FPS`, `VIDEO_WIDTH`, `VIDEO_HEIGHT`: Synthetic source configuration
+- `VIDEO_MAX_BITRATE`: Optional encoder bitrate cap in bps (e.g., `1500000`)
+- `VIDEO_MAX_FPS`: Optional encoder max framerate (e.g., `30`)
+- `VIDEO_SCALE_DOWN_BY`: Optional fractional/float downscale factor (encoder-side)
+- `VIDEO_PREFERRED_CODEC`: Preferred codec hint (`H264`, `VP8`, `VP9`)
+- `NDI_RECV_TIMEOUT_MS`: NDI capture poll timeout (default `50`)
+- `NDI_OUTPUT_PIXFMT`: Optional pre-conversion pixel format (e.g., `yuv420p`)
+- `NDI_RECV_COLOR`: Requested NDI receiver color format (default `UYVY`)
+  - Options: `UYVY`, `BGRA`/`BGRX`, `RGBA`/`RGBX`, `FASTEST`, `BEST`
+- `NDI_INTERNAL_RESIZE`: If `1`, resize frames to `VIDEO_WIDTH`/`VIDEO_HEIGHT` before encode (usually keep off)
+- `PORT`, `HOST`: Server bind address
+- `LOG_LEVEL`: Logging level (`INFO`, `DEBUG`, etc.)
+
+
 - `-host` / `HOST`: bind host (default `0.0.0.0`)
 - `-port` / `PORT`: bind port (default `8000`)
 - `-codec` / `VIDEO_CODEC`: `vp8` (default), `vp9`, `av1`
@@ -64,7 +81,13 @@ Most flags also read from environment variables. See `/config` at runtime for a 
   - SVT‑AV1: `go build -tags "svt yuv" ./cmd/whep`
   - libaom: `go build -tags "aom yuv" ./cmd/whep`
 
-Windows + NDI (cgo) requires the NDI SDK. For reproducible Windows builds and third‑party static libraries, see docs/BUILD.md.
+Windows + NDI (cgo) requires the NDI SDK. For reproducible Windows builds and third‑party static libraries, see `docs/BUILD.md`.
+
+### Performance Tips
+
+- Prefer encoder downscale (`VIDEO_SCALE_DOWN_BY`) over pre-scaling inside the NDI pipeline.
+- Enable profiling with `NDI_PROF=1` and `STATS_LOG=1` to log conversion / scaling / encode timings.
+
 
 More on dependencies and build tags: docs/DEPENDENCIES.md. Architecture overview: docs/ARCHITECTURE.md.
 

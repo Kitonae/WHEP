@@ -27,11 +27,15 @@ def build_tracks(ndi_source: Optional[str] = None, ndi_url: Optional[str] = None
         try:
             from .tracks.ndi_track import NdivideoTrack
 
-            # If width/height are provided via env, pass them to request scaling
-            w_env = os.getenv("VIDEO_WIDTH")
-            h_env = os.getenv("VIDEO_HEIGHT")
-            width = int(w_env) if w_env else None
-            height = int(h_env) if h_env else None
+            # By default, avoid in-track resizing for NDI; let the encoder scale via
+            # RTCRtpSender encodings (VIDEO_SCALE_DOWN_BY). To force in-track resize,
+            # set NDI_INTERNAL_RESIZE=1 and provide VIDEO_WIDTH/VIDEO_HEIGHT.
+            width = height = None
+            if (os.getenv("NDI_INTERNAL_RESIZE") or "").lower() in ("1", "true", "yes"):
+                w_env = os.getenv("VIDEO_WIDTH")
+                h_env = os.getenv("VIDEO_HEIGHT")
+                width = int(w_env) if w_env else None
+                height = int(h_env) if h_env else None
             video = NdivideoTrack(
                 source,
                 width=width,

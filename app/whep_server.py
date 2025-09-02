@@ -25,6 +25,8 @@ class WhepServer:
         self.ndi_exact_name = None
         # Shared NDI discovery cache (best-effort; falls back if unavailable)
         self.ndi_cache = NDINameCache(refresh_ms=1000)
+        self._stat_tasks: Dict[str, asyncio.Task] = {}
+        self._cpu_task: asyncio.Task | None = None
 
     async def on_startup(self, app: web.Application):
         # Start background discovery cache
@@ -33,6 +35,9 @@ class WhepServer:
             logger.info("NDI cache started")
         except Exception as e:
             logger.warning("NDI cache failed to start: %s", e)
+        # Optional CPU usage logger
+        if (os.getenv("STATS_LOG") or "").lower() in ("1", "true", "yes"):
+            self._cpu_task = asyncio.create_task(self._log_process_cpu())
 
     def _rtc_config(self) -> RTCConfiguration:
         ice_servers_env = os.getenv("ICE_SERVERS", "")
@@ -155,6 +160,9 @@ class WhepServer:
 
         location = str(request.url.join(request.app.router["whep_patch"].url_for(session_id=session_id)))
         headers = {"Location": location, "Content-Type": "application/sdp"}
+        # Start stats logger for this session if profiling is enabled
+        if (os.getenv("STATS_LOG") or "").lower() in ("1", "true", "yes"):
+            self._stat_tasks[session_id] = asyncio.create_task(self._log_sender_stats(session_id, sender))
         return web.Response(status=201, headers=headers, text=pc.localDescription.sdp)
 
     async def handle_whep_patch(self, request: web.Request) -> web.Response:
@@ -382,11 +390,77 @@ class WhepServer:
         if pc:
             logger.info("WHEP session %s: closing", session_id)
             await pc.close()
+        t = self._stat_tasks.pop(session_id, None)
+        if t:
+            t.cancel()
 
     async def on_shutdown(self, app: web.Application):
         tasks = [self._cleanup(sid) for sid in list(self.sessions.keys())]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel stat tasks if any linger
+        for t in list(self._stat_tasks.values()):
+            t.cancel()
+        self._stat_tasks.clear()
+        if self._cpu_task:
+            self._cpu_task.cancel()
+            self._cpu_task = None
+
+    async def _log_sender_stats(self, session_id: str, sender: RTCRtpSender):
+        prev = {}
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                try:
+                    stats = await sender.getStats()
+                except Exception as e:
+                    logger.debug("stats error: %s", e)
+                    continue
+                for s in stats.values():
+                    if getattr(s, 'type', None) == 'outbound-rtp' and getattr(s, 'kind', 'video') == 'video':
+                        frames = getattr(s, 'framesEncoded', None)
+                        bytes_sent = getattr(s, 'bytesSent', None)
+                        total_enc = getattr(s, 'totalEncodeTime', None)  # seconds
+                        ts = getattr(s, 'timestamp', None)
+                        key = 'video'
+                        if key in prev:
+                            p = prev[key]
+                            dt = (ts - p['ts']) / 1000.0 if ts and p['ts'] else 2.0
+                            d_frames = (frames - p['frames']) if frames is not None and p['frames'] is not None else None
+                            d_bytes = (bytes_sent - p['bytes']) if bytes_sent is not None and p['bytes'] is not None else None
+                            d_enc = (total_enc - p['enc']) if total_enc is not None and p['enc'] is not None else None
+                            fps = (d_frames / dt) if d_frames is not None and dt > 0 else None
+                            mbps = (d_bytes * 8 / 1e6 / dt) if d_bytes is not None and dt > 0 else None
+                            enc_ms = (1000.0 * d_enc / max(1, d_frames)) if d_enc is not None and d_frames and d_frames > 0 else None
+                            logger.info(
+                                "STATS %s: fps=%s bitrate=%.2f Mb/s enc=%.2f ms/frame frames=%s bytes=%s",
+                                session_id,
+                                f"{fps:.1f}" if fps is not None else "-",
+                                mbps or 0.0,
+                                enc_ms or 0.0,
+                                d_frames if d_frames is not None else "-",
+                                d_bytes if d_bytes is not None else "-",
+                            )
+                        prev[key] = {'frames': frames, 'bytes': bytes_sent, 'enc': total_enc, 'ts': ts}
+                        break
+        except asyncio.CancelledError:
+            pass
+
+    async def _log_process_cpu(self):
+        import time as _t
+        import os as _os
+        last_wall = _t.perf_counter()
+        last_cpu = _t.process_time()
+        while True:
+            await asyncio.sleep(2.0)
+            wall = _t.perf_counter()
+            cpu = _t.process_time()
+            dw = wall - last_wall
+            dc = cpu - last_cpu
+            last_wall, last_cpu = wall, cpu
+            if dw > 0:
+                pct = 100.0 * dc / dw
+                logger.info("PROC: cpu=%.1f%% cores=%s", pct, _os.cpu_count())
 
 
 @web.middleware
