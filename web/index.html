@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WHEP Player</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>WHEP Player</h1>
+      <p>Preview a WHEP stream by pointing to an endpoint (default: <code>/whep</code>).</p>
+    </header>
+    <main>
+      <section class="controls">
+        <div class="row">
+          <label>Endpoint</label>
+          <input id="endpoint" type="text" value="/whep" />
+        </div>
+        <div class="row">
+          <label>ICE Servers</label>
+          <input id="ice" type="text" placeholder="Comma-separated (e.g. stun:stun.l.google.com:19302)" />
+        </div>
+        <div class="row">
+          <label class="checkbox"><input id="mute" type="checkbox" checked /> Muted</label>
+          <label class="checkbox"><input id="autoplay" type="checkbox" checked /> Autoplay</label>
+        </div>
+        <div class="row buttons">
+          <button id="play">Play</button>
+          <button id="stop" disabled>Stop</button>
+        </div>
+      </section>
+      <section class="player">
+        <video id="video" playsinline></video>
+      </section>
+      <section class="log">
+        <pre id="log"></pre>
+      </section>
+    </main>
+    <script src="./main.js"></script>
+  </body>
+  </html>
+

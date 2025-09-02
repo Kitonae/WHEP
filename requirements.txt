@@ -1,0 +1,4 @@
+aiortc>=1.6
+numpy>=1.24
+av>=10.0.0
+aiohttp>=3.9

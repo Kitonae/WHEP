@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Standalone WHEP Player</title>
+    <style>
+      :root { --bg:#0b0f14; --fg:#e6edf3; --muted:#9aa7b1; --accent:#4aa3ff; --panel:#131a22; --border:#2a3540; }
+      *{box-sizing:border-box}
+      body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
+      header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);background:var(--panel)}
+      header h1{margin:0 0 .25rem;font-size:1.2rem}
+      header p{margin:0;color:var(--muted)}
+      main{padding:1rem 1.5rem;display:grid;gap:1rem;grid-template-columns:360px 1fr;grid-template-areas:"controls player" "log log";align-items:start}
+      .controls{grid-area:controls;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1rem}
+      .row{display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem}
+      label{width:110px;color:var(--muted)}
+      input[type=text]{flex:1;padding:.5rem .6rem;border-radius:6px;border:1px solid var(--border);background:#0f141b;color:var(--fg)}
+      .checkbox{width:auto}
+      .buttons{gap:.75rem}
+      button{padding:.5rem .9rem;border:1px solid var(--border);border-radius:6px;background:#182230;color:var(--fg);cursor:pointer}
+      button:hover{border-color:var(--accent)}
+      button:disabled{opacity:.6;cursor:not-allowed}
+      .player{grid-area:player}
+      video{width:100%;max-width:1280px;aspect-ratio:16 / 9;background:#000;border-radius:8px;border:1px solid var(--border)}
+      .log{grid-area:log;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1rem}
+      pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;color:#ccd6e3}
+      code{background:#101820;padding:.1rem .25rem;border-radius:4px}
+      @media (max-width: 960px){ main{grid-template-columns:1fr;grid-template-areas:"controls" "player" "log"} label{width:96px} }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Standalone WHEP Player</h1>
+      <p>Use with any WHEP endpoint. Defaults to <code>/whep</code> on the current origin. You can also set <code>?endpoint=...</code> in the URL.</p>
+    </header>
+    <main>
+      <section class="controls">
+        <div class="row">
+          <label>Endpoint</label>
+          <input id="endpoint" type="text" value="/whep" />
+        </div>
+        <div class="row">
+          <label>ICE Servers</label>
+          <input id="ice" type="text" placeholder="Comma-separated (e.g. stun:stun.l.google.com:19302)" />
+        </div>
+        <div class="row">
+          <label class="checkbox"><input id="mute" type="checkbox" checked /> Muted</label>
+          <label class="checkbox"><input id="autoplay" type="checkbox" checked /> Autoplay</label>
+        </div>
+        <div class="row buttons">
+          <button id="play">Play</button>
+          <button id="stop" disabled>Stop</button>
+        </div>
+      </section>
+      <section class="player"><video id="video" playsinline></video></section>
+      <section class="log"><pre id="log"></pre></section>
+    </main>
+    <script>
+      (function(){
+        const qs = (s) => document.querySelector(s);
+        const url = new URL(window.location.href);
+        const endpointParam = url.searchParams.get('endpoint');
+        const iceParam = url.searchParams.get('ice');
+        const logEl = qs('#log');
+        const videoEl = qs('#video');
+        const endpointEl = qs('#endpoint');
+        const iceEl = qs('#ice');
+        const muteEl = qs('#mute');
+        const autoplayEl = qs('#autoplay');
+        const playBtn = qs('#play');
+        const stopBtn = qs('#stop');
+
+        if (endpointParam) endpointEl.value = endpointParam;
+        if (iceParam) iceEl.value = iceParam;
+
+        let pc = null; let resource = null;
+        const log = (msg) => { const t = new Date().toISOString(); logEl.textContent += `[${t}] ${msg}\n`; logEl.scrollTop = logEl.scrollHeight; };
+        const parseIceServers = (text) => { if (!text || !text.trim()) return undefined; const parts = text.split(',').map(s=>s.trim()).filter(Boolean); return parts.length ? [{ urls: parts }] : undefined; };
+        const waitForIceGathering = (pc) => new Promise((resolve)=>{ if (pc.iceGatheringState==='complete') return resolve(); const onchg=()=>{ if (pc.iceGatheringState==='complete'){ pc.removeEventListener('icegatheringstatechange', onchg); resolve(); } }; pc.addEventListener('icegatheringstatechange', onchg); });
+
+        async function play(){
+          try{
+            const endpoint = endpointEl.value || '/whep';
+            const config = { iceServers: parseIceServers(iceEl.value) };
+            pc = new RTCPeerConnection(config);
+            videoEl.muted = !!muteEl.checked; videoEl.autoplay = !!autoplayEl.checked;
+            const inbound = new MediaStream();
+            pc.ontrack = (ev) => { inbound.addTrack(ev.track); videoEl.srcObject = inbound; };
+            pc.onconnectionstatechange = () => log(`state=${pc.connectionState}`);
+            pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState}`);
+            const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
+            await pc.setLocalDescription(offer);
+            await waitForIceGathering(pc); // non-trickle
+            log('POST offer → ' + endpoint);
+            const resp = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/sdp'}, body: pc.localDescription.sdp });
+            if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status);
+            resource = resp.headers.get('Location');
+            const answerSdp = await resp.text();
+            await pc.setRemoteDescription({ type:'answer', sdp: answerSdp });
+            log('Answer set. Streaming...');
+            playBtn.disabled = true; stopBtn.disabled = false;
+          }catch(err){
+            log('Error: ' + (err && err.message || err));
+            await stop();
+          }
+        }
+        async function stop(){
+          try{ if (resource){ try{ await fetch(resource, { method:'DELETE' }); }catch(e){} } }
+          finally { resource=null; if (pc){ pc.close(); pc=null; } playBtn.disabled=false; stopBtn.disabled=true; }
+        }
+        playBtn.addEventListener('click', play);
+        stopBtn.addEventListener('click', stop);
+      })();
+    </script>
+  </body>
+  </html>
+
