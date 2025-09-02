@@ -47,9 +47,11 @@ class NdivideoTrack(MediaStreamTrack):
         # Build receiver with robust fallback order: URL -> exact -> substring
         try:
             if self.source_url:
+                logger.info("NDI: creating receiver by URL: %s", self.source_url)
                 self._receiver = self._ndi.recv_create_from_url(self.source_url)
             elif self.exact_name:
                 # First try to resolve to URL and connect by URL
+                logger.debug("NDI: resolving exact name to URL: %s", self.exact_name)
                 for _ in range(0, 10):  # ~5s total at 500ms per try
                     try:
                         srcs = self._ndi.find_sources(timeout_ms=500)
@@ -60,14 +62,17 @@ class NdivideoTrack(MediaStreamTrack):
                                 found_url = (s.p_url_address or b"").decode("utf-8", errors="ignore")
                                 break
                         if found_url:
+                            logger.info("NDI: resolved exact name to URL: %s", found_url)
                             self._receiver = self._ndi.recv_create_from_url(found_url)
                             break
                     except Exception:
                         pass
                 if self._receiver is None:
                     # Fallback to substring match using provided name
+                    logger.info("NDI: falling back to substring match: %s", self.source_name or self.exact_name)
                     self._receiver = self._ndi.recv_create_from_name(self.source_name or self.exact_name, timeout_ms=2000)
             else:
+                logger.info("NDI: creating receiver by substring match: %s", self.source_name)
                 self._receiver = self._ndi.recv_create_from_name(self.source_name, timeout_ms=2000)
         except NDIError as e:
             logger.exception("Failed to create NDI receiver: %s", e)
@@ -92,18 +97,27 @@ class NdivideoTrack(MediaStreamTrack):
                 row_view = flat.reshape(h, stride)
                 trimmed = row_view[:, : w * 4].copy()
                 frame_bgra = trimmed.reshape(h, w, 4)
+                # Treat incoming as BGRA (NDI outputs BGRX/BGRA for this mode)
                 frame = VideoFrame.from_ndarray(frame_bgra, format="bgra")
-                if self.width and self.height and (self.width != w or self.height != h):
-                    frame = frame.reformat(width=self.width, height=self.height)
+                # Convert to a stable RGB24 frame for downstream
+                target_w = self.width or w
+                target_h = self.height or h
+                frame = frame.reformat(width=target_w, height=target_h, format="rgb24")
                 return frame
             finally:
                 # Always free the captured NDI frame in the same thread
                 self._ndi.recv_free_video(self._receiver, vf)
 
         try:
+            n = 0
             while True:
-                frame = await asyncio.to_thread(_capture_once)
+                try:
+                    frame = await asyncio.to_thread(_capture_once)
+                except Exception as e:
+                    logger.exception("NDI capture thread errored: %s", e)
+                    break
                 if frame is None:
+                    # timeout/no frame; yield control but keep loop going
                     await asyncio.sleep(0)
                     continue
                 # Try non-blocking put; drop if queue full to avoid lag buildup
@@ -112,6 +126,12 @@ class NdivideoTrack(MediaStreamTrack):
                 except asyncio.QueueFull:
                     _ = self._queue.get_nowait()
                     self._queue.put_nowait(frame)
+                n += 1
+                if n % 60 == 0:
+                    try:
+                        logger.debug("NDI: queued %d frames (%dx%d rgb)", n, frame.width, frame.height)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             pass
         finally:
@@ -126,10 +146,12 @@ class NdivideoTrack(MediaStreamTrack):
     def stop(self) -> None:
         try:
             if self._task:
+                logger.info("NDI: cancelling pull loop for %s", self.source_name)
                 self._task.cancel()
         finally:
             if self._ndi and self._receiver:
                 try:
+                    logger.debug("NDI: destroying receiver")
                     self._ndi.recv_destroy(self._receiver)
                 except Exception:
                     pass

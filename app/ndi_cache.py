@@ -78,6 +78,7 @@ class NDINameCache:
                     self._names = names
                     self._map = mapping
                     self._ts = time.time()
+                    logger.debug("NDINameCache: %d source(s) cached", len(names))
                 except Exception as e:
                     logger.debug("NDINameCache: discovery error: %s", e)
                 await asyncio.sleep(self.refresh_ms / 1000.0)
