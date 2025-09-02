@@ -159,17 +159,17 @@ class NdivideoTrack(VideoStreamTrack):
                         pixfmt = order_map.get(order, "rgba")
                         frame = VideoFrame.from_ndarray(frame_arr, format=pixfmt)
                     elif fourcc_str in ("UYVY", "2vuy", "YUY2", "YUYV"):
-                        # 4:2:2 packed YUV. Convert to RGB24.
-                        rgb = self._convert_yuv422_to_rgb24(row_view[:, : w * 2], w, h, fourcc_str)
-                        frame = VideoFrame.from_ndarray(rgb, format="rgb24")
+                        # 4:2:2 packed YUV. Convert directly to I420 (yuv420p) to reduce encoder work.
+                        Y, U420, V420 = self._uyvy_to_i420_planes(row_view[:, : w * 2], w, h, fourcc_str)
+                        frame = self._frame_from_i420_planes(Y, U420, V420)
                     else:
                         # If stride matches 2 bytes per pixel, treat as YUV422 (default UYVY unless overridden).
                         if stride >= w * 2 and stride < w * 4:
                             order = os.getenv("NDI_INPUT_YUV422_ORDER", "UYVY").upper()
                             if order not in ("UYVY", "YUY2", "YUYV", "2VUY"):
                                 order = "UYVY"
-                            rgb = self._convert_yuv422_to_rgb24(row_view[:, : w * 2], w, h, order)
-                            frame = VideoFrame.from_ndarray(rgb, format="rgb24")
+                            Y, U420, V420 = self._uyvy_to_i420_planes(row_view[:, : w * 2], w, h, order)
+                            frame = self._frame_from_i420_planes(Y, U420, V420)
                             if n % 120 == 0:
                                 logger.warning("NDI: unknown FourCC '%s' (%d); inferred 2bpp -> %s conversion", fourcc_str, fourcc, order)
                         else:
@@ -268,6 +268,87 @@ class NdivideoTrack(VideoStreamTrack):
 
         rgb = np.dstack((R, G, B))
         return rgb
+
+    @staticmethod
+    def _uyvy_to_i420_planes(rows: np.ndarray, w: int, h: int, fourcc: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Convert packed YUV422 (UYVY/YUY2) to planar I420 (Y, U, V).
+        Returns three contiguous arrays:
+          - Y: (h, w) uint8
+          - U: (h//2, w//2) uint8
+          - V: (h//2, w//2) uint8
+        """
+        active = rows[:, : w * 2]
+        quad = active.reshape(h, w // 2, 4)
+        if fourcc.upper() in ("UYVY", "2VUY"):
+            U = quad[:, :, 0]
+            Y0 = quad[:, :, 1]
+            V = quad[:, :, 2]
+            Y1 = quad[:, :, 3]
+        else:  # YUY2 / YUYV
+            Y0 = quad[:, :, 0]
+            U = quad[:, :, 1]
+            Y1 = quad[:, :, 2]
+            V = quad[:, :, 3]
+        # Build full-res Y
+        Y = np.empty((h, w), dtype=np.uint8)
+        Y[:, 0::2] = Y0
+        Y[:, 1::2] = Y1
+        # Downsample U and V vertically to 4:2:0 by averaging adjacent rows
+        U_even = U[0:h:2, :].astype(np.uint16)
+        U_odd = U[1:h:2, :].astype(np.uint16)
+        if U_odd.shape[0] != U_even.shape[0]:
+            U_odd = np.vstack([U_odd, U_odd[-1:]]) if U_odd.size else U_even
+        V_even = V[0:h:2, :].astype(np.uint16)
+        V_odd = V[1:h:2, :].astype(np.uint16)
+        if V_odd.shape[0] != V_even.shape[0]:
+            V_odd = np.vstack([V_odd, V_odd[-1:]]) if V_odd.size else V_even
+        U420 = ((U_even + U_odd) // 2).astype(np.uint8)
+        V420 = ((V_even + V_odd) // 2).astype(np.uint8)
+        try:
+            if os.getenv("NDI_SWAP_UV", "0") in ("1", "true", "True", "YES", "yes"):
+                U420, V420 = V420, U420
+        except Exception:
+            pass
+        return Y, U420, V420
+
+    @staticmethod
+    def _frame_from_i420_planes(Y: np.ndarray, U: np.ndarray, V: np.ndarray) -> VideoFrame:
+        """Create a VideoFrame in format yuv420p from planar Y, U, V arrays.
+        Handles stride differences by using plane.update().
+        """
+        h, w = Y.shape
+        frame = VideoFrame(width=w, height=h, format="yuv420p")
+        # Y plane
+        p0 = frame.planes[0]
+        if p0.line_size == w:
+            p0.update(Y.tobytes())
+        else:
+            # Fallback: copy row by row if padded
+            mv = memoryview(p0)
+            for y in range(h):
+                start = y * p0.line_size
+                mv[start:start + w] = Y[y].tobytes()
+        # U plane
+        ph = h // 2
+        pw = w // 2
+        p1 = frame.planes[1]
+        if p1.line_size == pw:
+            p1.update(U.tobytes())
+        else:
+            mv = memoryview(p1)
+            for y in range(ph):
+                start = y * p1.line_size
+                mv[start:start + pw] = U[y].tobytes()
+        # V plane
+        p2 = frame.planes[2]
+        if p2.line_size == pw:
+            p2.update(V.tobytes())
+        else:
+            mv = memoryview(p2)
+            for y in range(ph):
+                start = y * p2.line_size
+                mv[start:start + pw] = V[y].tobytes()
+        return frame
 
     async def recv(self) -> VideoFrame:
         if self._thread is None:
