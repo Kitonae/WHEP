@@ -21,7 +21,7 @@ func main() {
 	width := flag.Int("width", getEnvInt("VIDEO_WIDTH", 1280), "synthetic width")
 	height := flag.Int("height", getEnvInt("VIDEO_HEIGHT", 720), "synthetic height")
     bitrate := flag.Int("bitrate", getEnvInt("VIDEO_BITRATE_KBPS", 6000), "target video bitrate (kbps) for VP8/VP9")
-    codec := flag.String("codec", getEnv("VIDEO_CODEC", "vp8"), "video codec: vp8, vp9, h264, or av1")
+    codec := flag.String("codec", getEnv("VIDEO_CODEC", "vp8"), "video codec: vp8, vp9, or av1")
     hwaccel := flag.String("hwaccel", getEnv("VIDEO_HWACCEL", "none"), "hardware encoder: none, nvenc, qsv, amf")
     vp8speed := flag.Int("vp8speed", getEnvInt("VIDEO_VP8_SPEED", 8), "VP8 cpu_used speed (0=best, 8=fastest)")
     vp8drop := flag.Int("vp8dropframe", getEnvInt("VIDEO_VP8_DROPFRAME", 25), "VP8 drop-frame threshold (0=off, higher drops more)")

@@ -28,7 +28,7 @@ type Config struct {
     Width  int
     Height int
     BitrateKbps int
-    Codec  string // "vp8" (default) or "vp9"
+    Codec  string // "vp8" (default), "vp9", or "av1"
     HWAccel string // reserved for HW encoders (not used by AV1 here)
     VP8Speed int
     VP8Dropframe int

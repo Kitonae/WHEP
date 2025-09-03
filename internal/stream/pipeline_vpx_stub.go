@@ -4,7 +4,7 @@ package stream
 
 import "errors"
 
-// StartVP8Pipeline is unavailable without cgo; use StartH264Pipeline instead.
+// StartVP8Pipeline is unavailable without vpx/cgo build tags.
 func StartVP8Pipeline(cfg PipelineConfig) (*PipelineVP8, error) {
     return nil, errors.New("vp8 pipeline not available (cgo off)")
 }
