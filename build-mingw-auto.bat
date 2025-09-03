@@ -130,6 +130,11 @@ rem Try to convert to 8.3 format to avoid spaces
 for %%i in ("%NDI_INCLUDE%") do set "NDI_INCLUDE_SAFE=%%~si"
 for %%i in ("%NDI_LIB64%") do set "NDI_LIB64_SAFE=%%~si"
 for %%i in ("%LIBVPX_PATH%") do set "LIBVPX_PATH_SAFE=%%~si"
+
+rem Determine libvpx include dir: force using source headers to match built lib version
+set "LIBVPX_INCLUDE=%LIBVPX_PATH%\src"
+for %%i in ("%LIBVPX_INCLUDE%") do set "LIBVPX_INCLUDE_SAFE=%%~si"
+if "%LIBVPX_INCLUDE_SAFE%"=="" set "LIBVPX_INCLUDE_SAFE=%LIBVPX_INCLUDE%"
 for %%i in ("%LIBYUV_PATH%") do set "LIBYUV_PATH_SAFE=%%~si"
 for %%i in ("%LIBYUV_PATH%\src\include") do set "LIBYUV_INCLUDE_SAFE=%%~si"
 for %%i in ("%LIBYUV_PATH%\lib") do set "LIBYUV_LIB_SAFE=%%~si"
@@ -144,8 +149,14 @@ if "%LIBYUV_LIB_SAFE%"=="" set "LIBYUV_LIB_SAFE=%LIBYUV_PATH%\lib"
 
 rem CGO flags using safe paths and proper Windows library linking
 rem Add flags for Windows mingw runtime and libvpx
-set "CGO_CFLAGS=-I%NDI_INCLUDE_SAFE% -I%LIBVPX_PATH_SAFE%\include -I%LIBYUV_INCLUDE_SAFE%"
-set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%LIBYUV_LIB_SAFE% -L%NDI_LIB64_SAFE% -lProcessing.NDI.Lib.x64 -L%LIBVPX_PATH_SAFE%\lib -lvpx -L%LIBYUV_LIB_SAFE% -lyuv -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
+set "CGO_CFLAGS=-I%NDI_INCLUDE_SAFE% -I%LIBVPX_INCLUDE_SAFE% -I%LIBYUV_INCLUDE_SAFE%"
+rem Prefer static libvpx if available to avoid ABI mismatches with import libs
+if exist "%LIBVPX_PATH_SAFE%\lib\libvpx.a" (
+  set "VPX_LINK=-l:libvpx.a"
+) else (
+  set "VPX_LINK=-lvpx"
+)
+set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%LIBYUV_LIB_SAFE% -L%NDI_LIB64_SAFE% -lProcessing.NDI.Lib.x64 -L%LIBVPX_PATH_SAFE%\lib %VPX_LINK% -L%LIBYUV_LIB_SAFE% -lyuv -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
 
 rem Allow all CGO flags (MinGW is more permissive than MSVC)
 set "CGO_CFLAGS_ALLOW=.*"
@@ -164,6 +175,7 @@ echo   CXX=%CXX%
 echo   NDI_INCLUDE_SAFE=%NDI_INCLUDE_SAFE%
 echo   NDI_LIB64_SAFE=%NDI_LIB64_SAFE%
 echo   LIBVPX_PATH_SAFE=%LIBVPX_PATH_SAFE%
+echo   LIBVPX_INCLUDE_SAFE=%LIBVPX_INCLUDE_SAFE%
 echo   CGO_CFLAGS=%CGO_CFLAGS%
   echo   CGO_LDFLAGS=%CGO_LDFLAGS%
 echo   LIBYUV_PATH_SAFE=%LIBYUV_PATH_SAFE%

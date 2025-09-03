@@ -1,0 +1,3 @@
+"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\yuvconvert.dir/objects.a
+C:\msys64\mingw64\bin\ar.exe qc CMakeFiles\yuvconvert.dir/objects.a @CMakeFiles\yuvconvert.dir\objects1.rsp
+C:\msys64\mingw64\bin\g++.exe -O3 -DNDEBUG -Wl,--whole-archive CMakeFiles\yuvconvert.dir/objects.a -Wl,--no-whole-archive -o yuvconvert.exe -Wl,--out-implib,libyuvconvert.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\yuvconvert.dir\linkLibs.rsp

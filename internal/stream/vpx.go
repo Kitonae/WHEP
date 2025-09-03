@@ -32,6 +32,7 @@ import "C"
 
 import (
     "errors"
+    "fmt"
     "runtime"
     "unsafe"
 )
@@ -84,8 +85,13 @@ func NewVP8Encoder(cfg VP8Config) (*VP8Encoder, error) {
     e.cfg.kf_min_dist = 0
     e.cfg.kf_max_dist = C.uint(cfg.FPS * 4)
 
-    if C.vpx_codec_enc_init_ver(&e.ctx, C.vpx_iface_vp8(), &e.cfg, 0, C.VPX_ENCODER_ABI_VERSION) != C.VPX_CODEC_OK {
-        return nil, errors.New("vpx_codec_enc_init_ver failed")
+    if st := C.vpx_codec_enc_init_ver(&e.ctx, C.vpx_iface_vp8(), &e.cfg, 0, C.VPX_ENCODER_ABI_VERSION); st != C.VPX_CODEC_OK {
+        // Try to extract detailed error message from context
+        errStr := C.GoString(C.vpx_codec_err_to_string(st))
+        // Some detail may be available on the context even on init failure
+        more := C.GoString(C.vpx_codec_error_detail(&e.ctx))
+        if more != "" { errStr = fmt.Sprintf("%s: %s", errStr, more) }
+        return nil, fmt.Errorf("vpx_codec_enc_init_ver failed (%dx%d@%dfps, %dkbps): %s", cfg.Width, cfg.Height, cfg.FPS, cfg.BitrateKbps, errStr)
     }
     // Apply speed-focused controls
     spd := cfg.Speed
@@ -208,8 +214,11 @@ func NewVP9Encoder(cfg VP9Config) (*VP9Encoder, error) {
     e.cfg.rc_end_usage = C.VPX_CBR
     e.cfg.kf_mode = C.VPX_KF_AUTO
 
-    if C.vpx_codec_enc_init_ver(&e.ctx, C.vpx_iface_vp9(), &e.cfg, 0, C.VPX_ENCODER_ABI_VERSION) != C.VPX_CODEC_OK {
-        return nil, errors.New("vpx_codec_enc_init_ver failed")
+    if st := C.vpx_codec_enc_init_ver(&e.ctx, C.vpx_iface_vp9(), &e.cfg, 0, C.VPX_ENCODER_ABI_VERSION); st != C.VPX_CODEC_OK {
+        errStr := C.GoString(C.vpx_codec_err_to_string(st))
+        more := C.GoString(C.vpx_codec_error_detail(&e.ctx))
+        if more != "" { errStr = fmt.Sprintf("%s: %s", errStr, more) }
+        return nil, fmt.Errorf("vpx_codec_enc_init_ver failed (%dx%d@%dfps, %dkbps): %s", cfg.Width, cfg.Height, cfg.FPS, cfg.BitrateKbps, errStr)
     }
     e.img = C.vpx_img_alloc(nil, C.VPX_IMG_FMT_I420, C.uint(e.w), C.uint(e.h), 1)
     if e.img == nil {

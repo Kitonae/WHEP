@@ -50,6 +50,8 @@ func NewNDISource(url, name string) (*NDISource, error) {
         if err != nil { return nil, err }
     }
     s := &NDISource{rx: rx, quit: make(chan struct{})}
+    // Register a live source for health tracking
+    registerSource()
     go s.loop()
     return s, nil
 }
@@ -60,6 +62,7 @@ var (
 )
 
 func (s *NDISource) loop() {
+    defer unregisterSource()
     for {
         select { case <-s.quit: return; default: }
         vf, ok, err := s.rx.CaptureVideo(50)

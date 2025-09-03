@@ -1,6 +1,7 @@
 package server
 
 import (
+    "context"
     "encoding/json"
     "fmt"
     "io"
@@ -44,11 +45,16 @@ type WhepServer struct {
 }
 
 type session struct {
-    pc     *webrtc.PeerConnection
-    sender *webrtc.RTPSender
-    track  interface{}
-    stop   func()
-    src    stream.Source
+    id       string
+    pc       *webrtc.PeerConnection
+    sender   *webrtc.RTPSender
+    track    interface{}
+    stop     func()
+    src      stream.Source
+    cancelFunc context.CancelFunc
+    codec    string
+    created  time.Time
+    state    string
 }
 
 func NewWhepServer(cfg Config) *WhepServer {
@@ -68,14 +74,32 @@ func (s *WhepServer) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/ndi/sources", s.handleNDISources)
     mux.HandleFunc("/ndi/select", s.handleNDISelect)
     mux.HandleFunc("/ndi/select_url", s.handleNDISelectURL)
+    mux.HandleFunc("/config", s.handleConfig)
+    mux.HandleFunc("/config/", s.handleConfig) // support trailing slash
     mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        s.mu.Lock(); name,url := s.ndiName, s.ndiURL; sessCount := len(s.sessions); s.mu.Unlock()
+        s.mu.Lock(); name,url := s.ndiName, s.ndiURL; sessCount := len(s.sessions)
+        // build detailed session info for leak detection
+        details := make([]map[string]any, 0, sessCount)
+        for id, ss := range s.sessions {
+            details = append(details, map[string]any{
+                "id": id,
+                "codec": ss.codec,
+                "created": ss.created.UTC().Format(time.RFC3339),
+                "pc_state": ss.state,
+                "has_source": ss.src != nil,
+                "has_stop": ss.stop != nil,
+            })
+        }
+        s.mu.Unlock()
         metrics := stream.GetCounters()
+        runtimeStats := stream.GetRuntimeStats()
         out := map[string]any{
             "status":   "ok",
             "sessions": sessCount,
             "ndi":      map[string]any{"selected": name, "url": url},
             "metrics":  metrics,
+            "runtime":  runtimeStats,
+            "sessions_detail": details,
         }
         if v, ok := metrics["frames_dropped"]; ok { out["dropped_frames"] = v }
         _ = json.NewEncoder(w).Encode(out)
@@ -212,6 +236,9 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
         stopper = pipeVP8
     }
 
+    // Create a cancellable context for the resolution monitoring goroutine
+    ctx, cancelFunc := context.WithCancel(context.Background())
+    
     // Monitor for source resolution changes and restart pipeline when needed
     type sourceWithLast interface{ Last() ([]byte,int,int,bool) }
     if src != nil {
@@ -221,38 +248,52 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
             go func() {
                 ticker := time.NewTicker(1 * time.Second)
                 defer ticker.Stop()
-                for range ticker.C {
-                    _, w0, h0, ok := reporter.Last()
-                    if !ok || w0 <= 0 || h0 <= 0 { continue }
-                    // Avoid restart if unchanged
-                    if w0 == currentW && h0 == currentH { continue }
-                    log.Printf("Pipeline: source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
-                    // Restart pipeline with new size
-                    pipeMu.Lock()
-                    if stopper != nil { stopper.Stop() }
-                    var newStop interface{ Stop() }
-                    var p interface{ Stop() }
-                    var err error
-                    switch codec {
-                    case "vp9":
-                        p, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
-                    case "av1":
-                        p, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
-                    default:
-                        p, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
-                    }
-                    newStop = p
-                    if err != nil {
-                        log.Printf("Pipeline: restart failed: %v", err)
+                for {
+                    select {
+                    case <-ctx.Done():
+                        return
+                    case <-ticker.C:
+                        _, w0, h0, ok := reporter.Last()
+                        if !ok || w0 <= 0 || h0 <= 0 { continue }
+                        // Avoid restart if unchanged
+                        if w0 == currentW && h0 == currentH { continue }
+                        log.Printf("Pipeline: source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
+                        // Restart pipeline with new size
+                        pipeMu.Lock()
+                        if stopper != nil { stopper.Stop() }
+                        var newStop interface{ Stop() }
+                        var p interface{ Stop() }
+                        var err error
+                        switch codec {
+                        case "vp9":
+                            p, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                        case "av1":
+                            p, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                        default:
+                            p, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
+                        }
+                        newStop = p
+                        if err != nil {
+                            log.Printf("Pipeline: restart failed: %v", err)
+                            pipeMu.Unlock()
+                            continue
+                        }
+                        stopper = newStop
+                        // Update session stop func if session is registered
+                        s.mu.Lock()
+                        if ss, ok := s.sessions[id]; ok && newStop != nil {
+                            ss.stop = newStop.Stop
+                        }
+                        s.mu.Unlock()
+                        currentW, currentH = w0, h0
                         pipeMu.Unlock()
-                        continue
                     }
-                    stopper = newStop
-                    currentW, currentH = w0, h0
-                    pipeMu.Unlock()
                 }
             }()
         }
+    } else {
+        // If no NDI source, create a no-op cancelFunc
+        cancelFunc = func() {}
     }
 
     // WHEP semantics: set remote offer, answer, and wait for ICE gather complete
@@ -277,15 +318,44 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     }
     <-gatherComplete
 
-    sess := &session{pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop, src: src}
+    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop, src: src, cancelFunc: cancelFunc, codec: codec, created: time.Now() }
     s.mu.Lock(); s.sessions[id] = sess; s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
         log.Printf("Session %s state: %s", id, state)
+        // Track last known state for /health
+        s.mu.Lock()
+        if ss, ok := s.sessions[id]; ok { ss.state = state.String() }
+        s.mu.Unlock()
         if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateDisconnected {
             s.closeSession(id)
         }
     })
+
+    // Add timeout for failed connections - clean up sessions that don't connect within 30 seconds
+    go func() {
+        timer := time.NewTimer(30 * time.Second)
+        defer timer.Stop()
+        
+        select {
+        case <-timer.C:
+            // Check if session is still in connecting state and clean it up
+            s.mu.Lock()
+            if sess, exists := s.sessions[id]; exists {
+                currentState := sess.pc.ConnectionState()
+                if currentState == webrtc.PeerConnectionStateNew || currentState == webrtc.PeerConnectionStateConnecting {
+                    log.Printf("Session %s: timeout after 30s, cleaning up (state: %s)", id, currentState)
+                    s.mu.Unlock()
+                    s.closeSession(id)
+                    return
+                }
+            }
+            s.mu.Unlock()
+        case <-ctx.Done():
+            // Session was closed before timeout
+            return
+        }
+    }()
 
     allowCORS(w, r)
     w.Header().Set("Content-Type", "application/sdp")
@@ -431,6 +501,10 @@ func (s *WhepServer) restartSessionPipeline(ss *session) error {
 func (s *WhepServer) closeSession(id string) {
     s.mu.Lock(); sess := s.sessions[id]; delete(s.sessions, id); s.mu.Unlock()
     if sess != nil {
+        // Cancel the resolution monitoring goroutine first
+        if sess.cancelFunc != nil {
+            sess.cancelFunc()
+        }
         if sess.stop != nil { sess.stop() }
         if sess.src != nil { sess.src.Stop() }
         _ = sess.pc.Close()
@@ -508,30 +582,96 @@ func allowCORS(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 }
 
+// handleConfig serves a simple HTML page that documents and shows current
+// configuration as driven by command-line flags and environment variables.
+func (s *WhepServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+    allowCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+    if r.Method != http.MethodGet { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+
+    // Snapshot environment and current runtime selections
+    getenv := func(k string) string { return strings.TrimSpace(os.Getenv(k)) }
+    s.mu.Lock(); selNDIName, selNDIURL := s.ndiName, s.ndiURL; s.mu.Unlock()
+
+    // Build rows for flags (and their env equivalents)
+    type row struct{ Name, Flag, Env, Value, Default, Desc string }
+    rows := []row{
+        {Name: "Host", Flag: "-host", Env: "HOST", Value: s.cfg.Host, Default: "0.0.0.0", Desc: "HTTP bind host"},
+        {Name: "Port", Flag: "-port", Env: "PORT", Value: fmt.Sprintf("%d", s.cfg.Port), Default: "8000", Desc: "HTTP bind port"},
+        {Name: "FPS", Flag: "-fps", Env: "FPS", Value: fmt.Sprintf("%d", s.cfg.FPS), Default: "30", Desc: "Frames per second (synthetic/when used)"},
+        {Name: "Width", Flag: "-width", Env: "VIDEO_WIDTH", Value: fmt.Sprintf("%d", s.cfg.Width), Default: "1280", Desc: "Video width (synthetic/initial)"},
+        {Name: "Height", Flag: "-height", Env: "VIDEO_HEIGHT", Value: fmt.Sprintf("%d", s.cfg.Height), Default: "720", Desc: "Video height (synthetic/initial)"},
+        {Name: "Bitrate", Flag: "-bitrate", Env: "VIDEO_BITRATE_KBPS", Value: fmt.Sprintf("%d", s.cfg.BitrateKbps), Default: "6000", Desc: "Target video bitrate (kbps)"},
+        {Name: "Codec", Flag: "-codec", Env: "VIDEO_CODEC", Value: s.cfg.Codec, Default: "vp8", Desc: "Video codec: vp8, vp9, av1"},
+        {Name: "HW Accel", Flag: "-hwaccel", Env: "VIDEO_HWACCEL", Value: s.cfg.HWAccel, Default: "none", Desc: "Reserved; hardware encoder selection"},
+        {Name: "VP8 Speed", Flag: "-vp8speed", Env: "VIDEO_VP8_SPEED", Value: fmt.Sprintf("%d", s.cfg.VP8Speed), Default: "8", Desc: "VP8 cpu_used speed (0=best, 8=fastest)"},
+        {Name: "VP8 Dropframe", Flag: "-vp8dropframe", Env: "VIDEO_VP8_DROPFRAME", Value: fmt.Sprintf("%d", s.cfg.VP8Dropframe), Default: "25", Desc: "VP8 drop-frame threshold (0=off)"},
+        {Name: "NDI Color", Flag: "-color", Env: "NDI_RECV_COLOR", Value: getenv("NDI_RECV_COLOR"), Default: "", Desc: "NDI receive color: bgra or uyvy"},
+    }
+
+    // Additional environment-only controls
+    envOnly := []row{
+        {Name: "NDI Source Name", Flag: "(n/a)", Env: "NDI_SOURCE", Value: getenv("NDI_SOURCE"), Default: "", Desc: "Preferred NDI source display name"},
+        {Name: "NDI Source URL", Flag: "(n/a)", Env: "NDI_SOURCE_URL", Value: getenv("NDI_SOURCE_URL"), Default: "", Desc: "Preferred NDI source URL (ndi://...)"},
+        {Name: "NDI Groups", Flag: "(n/a)", Env: "NDI_GROUPS", Value: getenv("NDI_GROUPS"), Default: "", Desc: "Comma-separated NDI groups for discovery"},
+        {Name: "NDI Extra IPs", Flag: "(n/a)", Env: "NDI_EXTRA_IPS", Value: getenv("NDI_EXTRA_IPS"), Default: "", Desc: "Comma-separated unicast IPs for discovery"},
+        {Name: "YUV BGRA Order", Flag: "(n/a)", Env: "YUV_BGRA_ORDER", Value: getenv("YUV_BGRA_ORDER"), Default: "", Desc: "Override BGRA byte order for converters"},
+        {Name: "YUV Swap UV", Flag: "(n/a)", Env: "YUV_SWAP_UV", Value: getenv("YUV_SWAP_UV"), Default: "", Desc: "Swap U/V planes in converters (1/true)"},
+    }
+
+    // Runtime selections/info
+    runtimeInfo := []row{
+        {Name: "Selected NDI Name", Flag: "(runtime)", Env: "(runtime)", Value: selNDIName, Default: "", Desc: "Current selected source name"},
+        {Name: "Selected NDI URL", Flag: "(runtime)", Env: "(runtime)", Value: selNDIURL, Default: "", Desc: "Current selected source URL"},
+        {Name: "Color Conversion", Flag: "(build)", Env: "(build)", Value: stream.ColorConversionImpl(), Default: "", Desc: "libyuv or pure-go"},
+    }
+
+    // Render HTML
+    var b strings.Builder
+    b.WriteString("<!doctype html><meta charset=\"utf-8\"><title>WHEP Config</title>")
+    b.WriteString(`<style>body{font-family:system-ui;margin:2rem} table{border-collapse:collapse} th,td{border:1px solid #ddd;padding:.4rem .6rem} th{background:#f5f5f5;text-align:left} code{background:#f6f8fa;padding:.1rem .25rem;border-radius:3px}</style>`)
+    b.WriteString("<h1>WHEP Configuration</h1>")
+    fmt.Fprintf(&b, "<p>Listening on <code>%s:%d</code>. This page lists command-line flags and environment variables that control the server.</p>", s.cfg.Host, s.cfg.Port)
+
+    // Helper to print a table
+    printTable := func(title string, list []row) {
+        fmt.Fprintf(&b, "<h2>%s</h2>", title)
+        b.WriteString("<table><tr><th>Name</th><th>Flag</th><th>Env</th><th>Value</th><th>Default</th><th>Description</th></tr>")
+        for _, r := range list {
+            fmt.Fprintf(&b, "<tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>",
+                htmlEscape(r.Name), htmlEscape(r.Flag), htmlEscape(r.Env), htmlEscape(r.Value), htmlEscape(r.Default), htmlEscape(r.Desc))
+        }
+        b.WriteString("</table>")
+    }
+
+    printTable("Flags + Env", rows)
+    printTable("Environment Only", envOnly)
+    printTable("Runtime Info", runtimeInfo)
+
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
+    _, _ = io.WriteString(w, b.String())
+}
+
+// htmlEscape performs minimal HTML escaping for text nodes
+func htmlEscape(s string) string {
+    s = strings.ReplaceAll(s, "&", "&amp;")
+    s = strings.ReplaceAll(s, "<", "&lt;")
+    s = strings.ReplaceAll(s, ">", "&gt;")
+    return s
+}
+
 const indexHTML = `<!doctype html>
 <meta charset="utf-8" />
-<title>Pion WHEP Test</title>
-<style>body{font-family:system-ui;margin:2rem}video{width:80vw;max-width:1280px;background:#000}</style>
-<div>
-  <input id="ep" value="/whep" style="width:30rem"/> 
-  <button id="play">Play</button>
-  <button id="stop" disabled>Stop</button>
-  <div id="msg"></div>
-</div>
-<video id="v" playsinline autoplay muted></video>
-<script>
-let pc=null, res=null; const $=id=>document.getElementById(id);
-$("play").onclick = async ()=>{
-  const ep=$("ep").value; pc=new RTCPeerConnection();
-  pc.ontrack = ev=>{$("v").srcObject=ev.streams[0];}
-  const offer = await pc.createOffer({offerToReceiveVideo:true});
-  await pc.setLocalDescription(offer);
-  const resp=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/sdp'},body:offer.sdp});
-  res=resp.headers.get('Location'); const sdp=await resp.text();
-  await pc.setRemoteDescription({type:'answer', sdp});
-  $("stop").disabled=false;
-}
-$("stop").onclick = async ()=>{
-  if(res){await fetch(res,{method:'DELETE'})} if(pc){pc.close()} $("stop").disabled=true;
-}
-</script>`
+<title>WHEP Server</title>
+<style>body{font-family:system-ui;margin:2rem} a{color:#0366d6;text-decoration:none} a:hover{text-decoration:underline}</style>
+<h1>WHEP Server</h1>
+<p>This server exposes a WHEP endpoint for receiving offers and returning answers. No player is embedded on this page.</p>
+<ul>
+  <li><a href="/config">/config</a> — configuration and runtime info</li>
+  <li><a href="/health">/health</a> — health/metrics (JSON)</li>
+  <li><code>POST /whep</code> — WHEP endpoint (send SDP offer)</li>
+  <li><code>GET /frame</code> — latest frame as PNG (when available)</li>
+  <li><code>GET /ndi/sources</code> — list NDI sources</li>
+  <li><code>POST /ndi/select</code> — select NDI by name substring</li>
+  <li><code>POST /ndi/select_url</code> — select NDI by URL</li>
+<ul>`

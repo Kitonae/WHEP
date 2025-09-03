@@ -38,16 +38,25 @@ func (p *PipelineAV1) start() error {
             }
         }
     }
+    // Ensure even dimensions for I420 (4:2:0)
+    if p.cfg.Width%2 != 0 { p.cfg.Width-- }
+    if p.cfg.Height%2 != 0 { p.cfg.Height-- }
+    if p.cfg.Width < 2 { p.cfg.Width = 2 }
+    if p.cfg.Height < 2 { p.cfg.Height = 2 }
     bk := p.cfg.BitrateKbps; if bk <= 0 { bk = 6000 }
     e, err := NewAV1Encoder(AV1Config{Width:p.cfg.Width, Height:p.cfg.Height, FPS:p.cfg.FPS, BitrateKbps:bk})
     if err != nil { return err }
     p.enc = e
     p.quit = make(chan struct{})
+    // Register pipeline as active
+    registerPipeline("av1")
     go p.loop()
     return nil
 }
 
 func (p *PipelineAV1) loop() {
+    // Track active encoder lifecycle
+    defer unregisterPipeline("av1")
     defer p.enc.Close()
     y := make([]byte, p.cfg.Width*p.cfg.Height)
     u := make([]byte, (p.cfg.Width/2)*(p.cfg.Height/2))

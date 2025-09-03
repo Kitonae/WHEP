@@ -13,6 +13,10 @@ package stream
 
 static const aom_codec_iface_t* aom_iface_av1() { return aom_codec_av1_cx(); }
 
+// Wrapper helpers for vararg aom_codec_control macro
+static int set_aom_cpuused(aom_codec_ctx_t *ctx, int v) { return aom_codec_control(ctx, AOME_SET_CPUUSED, v); }
+static int set_aom_enableautoaltref(aom_codec_ctx_t *ctx, int v) { return aom_codec_control(ctx, AOME_SET_ENABLEAUTOALTREF, v); }
+
 typedef struct aom_frame_data {
     void *buf;
     size_t sz;
@@ -64,14 +68,14 @@ func NewAV1Encoder(cfg AV1Config) (*AV1Encoder, error) {
     e.cfg.g_threads = 4
     e.cfg.rc_end_usage = C.AOM_CBR
     e.cfg.kf_mode = C.AOM_KF_AUTO
+    e.cfg.g_usage = C.uint(C.AOM_USAGE_REALTIME)
 
     if C.aom_codec_enc_init_ver(&e.ctx, C.aom_iface_av1(), &e.cfg, 0, C.AOM_ENCODER_ABI_VERSION) != C.AOM_CODEC_OK {
         return nil, errors.New("aom_codec_enc_init_ver failed")
     }
     // speed-up for realtime: set cpu-used
-    _ = C.aom_codec_control_(&e.ctx, C.AOME_SET_CPUUSED, C.int(6))
-    _ = C.aom_codec_control_(&e.ctx, C.AOME_SET_ENABLEAUTOALTREF, C.int(0))
-    _ = C.aom_codec_control_(&e.ctx, C.AOME_SET_USAGE, C.int(C.AOM_USAGE_REALTIME))
+    _ = C.set_aom_cpuused(&e.ctx, C.int(6))
+    _ = C.set_aom_enableautoaltref(&e.ctx, C.int(0))
 
     // Allocate I420 image
     e.img = C.aom_img_alloc(nil, C.AOM_IMG_FMT_I420, C.uint(e.w), C.uint(e.h), 1)
@@ -123,7 +127,7 @@ func (e *AV1Encoder) EncodeI420(y, u, v []byte) (out [][]byte, keyframe bool, er
     for {
         pkt := C.aom_codec_get_cx_data(&e.ctx, &iter)
         if pkt == nil { break }
-        if pkt._type != C.AOM_CODEC_CX_FRAME_PKT { continue }
+        if pkt.kind != C.AOM_CODEC_CX_FRAME_PKT { continue }
         f := (*C.aom_codec_cx_pkt_t)(unsafe.Pointer(pkt))
         var frameData C.aom_frame_data_t
         C.memcpy(unsafe.Pointer(&frameData), unsafe.Pointer(&f.data), C.size_t(unsafe.Sizeof(frameData)))

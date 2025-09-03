@@ -43,17 +43,26 @@ func (p *PipelineVP8) start() error {
             }
         }
     }
+    // Ensure even dimensions for I420 (4:2:0) subsampling
+    if p.cfg.Width%2 != 0 { p.cfg.Width-- }
+    if p.cfg.Height%2 != 0 { p.cfg.Height-- }
+    if p.cfg.Width < 2 { p.cfg.Width = 2 }
+    if p.cfg.Height < 2 { p.cfg.Height = 2 }
 bk := p.cfg.BitrateKbps
     if bk <= 0 { bk = 6000 }
     e, err := NewVP8Encoder(VP8Config{Width: p.cfg.Width, Height: p.cfg.Height, FPS: p.cfg.FPS, BitrateKbps: bk, Speed: p.cfg.VP8Speed, Dropframe: p.cfg.VP8Dropframe})
     if err != nil { return err }
     p.enc = e
     p.quit = make(chan struct{})
+    // Register pipeline as active
+    registerPipeline("vp8")
     go p.loop()
     return nil
 }
 
 func (p *PipelineVP8) loop() {
+    // Track active encoder lifecycle
+    defer unregisterPipeline("vp8")
     defer p.enc.Close()
     y := make([]byte, p.cfg.Width*p.cfg.Height)
     u := make([]byte, (p.cfg.Width/2)*(p.cfg.Height/2))
