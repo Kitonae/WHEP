@@ -25,7 +25,21 @@ func main() {
     hwaccel := flag.String("hwaccel", getEnv("VIDEO_HWACCEL", "none"), "hardware encoder: none, nvenc, qsv, amf")
     vp8speed := flag.Int("vp8speed", getEnvInt("VIDEO_VP8_SPEED", 8), "VP8 cpu_used speed (0=best, 8=fastest)")
     vp8drop := flag.Int("vp8dropframe", getEnvInt("VIDEO_VP8_DROPFRAME", 25), "VP8 drop-frame threshold (0=off, higher drops more)")
+    color := flag.String("color", getEnv("NDI_RECV_COLOR", ""), "NDI receive color: bgra or uyvy (overrides NDI_RECV_COLOR)")
 	flag.Parse()
+
+    // Apply -color override for NDI receive color format if provided
+    if color != nil && *color != "" {
+        c := *color
+        if c == "bgra" || c == "BGRA" || c == "bgrx" || c == "BGRX" {
+            _ = os.Setenv("NDI_RECV_COLOR", "BGRA")
+        } else if c == "uyvy" || c == "UYVY" {
+            _ = os.Setenv("NDI_RECV_COLOR", "UYVY")
+        } else {
+            // pass through raw to allow future formats
+            _ = os.Setenv("NDI_RECV_COLOR", c)
+        }
+    }
 
 	cfg := server.Config{
 		Host:        *host,
