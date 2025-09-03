@@ -57,8 +57,6 @@ Most flags also read from environment variables. See `/config` at runtime for a 
 - `NDI_INTERNAL_RESIZE`: If `1`, resize frames to `VIDEO_WIDTH`/`VIDEO_HEIGHT` before encode (usually keep off)
 - `PORT`, `HOST`: Server bind address
 - `LOG_LEVEL`: Logging level (`INFO`, `DEBUG`, etc.)
-
-
 - `-host` / `HOST`: bind host (default `0.0.0.0`)
 - `-port` / `PORT`: bind port (default `8000`)
 - `-codec` / `VIDEO_CODEC`: `vp8` (default), `vp9`, `av1`
@@ -87,7 +85,6 @@ Windows + NDI (cgo) requires the NDI SDK. For reproducible Windows builds and th
 
 - Prefer encoder downscale (`VIDEO_SCALE_DOWN_BY`) over pre-scaling inside the NDI pipeline.
 - Enable profiling with `NDI_PROF=1` and `STATS_LOG=1` to log conversion / scaling / encode timings.
-
 
 More on dependencies and build tags: docs/DEPENDENCIES.md. Architecture overview: docs/ARCHITECTURE.md.
 
