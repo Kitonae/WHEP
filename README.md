@@ -1,91 +1,107 @@
-NDI → WHEP Server (Python)
+# WHEP — Minimal WebRTC HTTP Egress server (Go)
 
-Overview
+WHEP serves live video over WebRTC using the WHEP pattern (HTTP egress). It captures frames from an NDI source (Windows + NDI SDK) or generates a synthetic test pattern, converts to I420, encodes (VP8/VP9/AV1), and streams to browsers via Pion.
 
-- Serves a WHEP endpoint (`POST /whep`) that answers WebRTC offers with a media stream.
-- Primary source is an NDI receiver (requires NewTek NDI SDK and Python bindings).
-- Falls back to a synthetic test video if NDI is not available.
+- Small Go HTTP server with Pion WebRTC
+- Pluggable sources: NDI or synthetic
+- Pluggable color conversion: libyuv (SIMD) or pure‑Go
+- Encoders: libvpx (VP8/VP9) or AV1 (SVT‑AV1/libaom)
+- Simple WHEP endpoints, health, and NDI control APIs
 
-Quick Start
 
-1) Install dependencies (system must have Python 3.9+):
+## Quick Start
 
-   pip install -r requirements.txt
+- Build (CPU-only VP8 with libyuv if available):
+  - `go build -tags "vpx yuv" ./cmd/whep`
+- Run:
+  - `./whep -port 8000 -codec vp8 -bitrate 4000`
+- Play in a browser:
+  - Open `standalone-player.html`, set endpoint to `http://localhost:8000/whep`, click Play.
 
-2) Run the server (synthetic video by default):
+No player is embedded at `/`; it exposes links to `/config` and `/health`.
 
-   python -m app --host 0.0.0.0 --port 8000 --fps 30 --width 1280 --height 720
+Tip: For a synthetic “Splash” source while testing NDI flows, select the NDI name `splash` (see API below).
 
-3) Preview in the built-in web player:
 
-   - Open http://localhost:8000/player in your browser and click Play.
-   - Or use the minimal test page at http://localhost:8000/.
+## Endpoints
 
-4) Use with any WHEP client:
+- `POST /whep` (WHEP):
+  - Request body: SDP offer (non‑trickle; the player gathers ICE first)
+  - Response: SDP answer text, `201 Created`, `Location` header with resource URL
+  - Resource URL supports `DELETE` to end the session and `PATCH` per WHEP
+- `GET /config`: HTML page with current flags/env and runtime selections
+- `GET /health`: JSON with sessions, metrics, runtime stats
+- `GET /frame`: Latest frame as PNG (from NDI or synthetic fallback)
+- NDI control:
+  - `GET /ndi/sources` → list discovered sources
+  - `POST /ndi/select` with JSON `{ "name": "substring" }` → pick by display name
+  - `POST /ndi/select_url` with JSON `{ "url": "ndi://..." }` → pick by URL
 
-   - WHEP endpoint: http://localhost:8000/whep
-   - Client creates an SDP offer and POSTs it as `application/sdp`.
-   - Server replies `201 Created` with SDP answer and a `Location` header for the session.
 
-Environment Variables
+## CLI Flags and Env
 
-- `NDI_SOURCE`: Name of the NDI source to receive (enables NDI).
-- `ICE_SERVERS`: Comma-separated STUN/TURN URLs (e.g., `stun:stun.l.google.com:19302`).
-- `FPS`, `VIDEO_WIDTH`, `VIDEO_HEIGHT`: Synthetic source configuration.
-- `VIDEO_MAX_BITRATE`: Optional video encoder cap in bps (e.g., `1500000`).
-- `VIDEO_MAX_FPS`: Optional encoder max framerate (e.g., `30`).
-- `VIDEO_SCALE_DOWN_BY`: Optional downscale factor at the encoder (e.g., `2` to halve).
-- `VIDEO_PREFERRED_CODEC`: Preferred codec (`H264`, `VP8`, `VP9`), default `H264`.
-- `NDI_RECV_TIMEOUT_MS`: NDI capture poll timeout (default `50`).
-- `NDI_OUTPUT_PIXFMT`: Optional pre-conversion pixel format (e.g., `yuv420p`).
-- `NDI_RECV_COLOR`: Requested NDI receiver color format. Defaults to `UYVY` for broad compatibility.
-  - Options: `UYVY`, `BGRX`/`BGRA`, `RGBX`/`RGBA`, `FASTEST`, `BEST`.
-  - If unsure, keep default `UYVY`.
-- `PORT`, `HOST`: Server bind address.
-- `LOG_LEVEL`: Logging level (e.g., `INFO`, `DEBUG`).
+Most flags also read from environment variables. See `/config` at runtime for a live view.
 
-NDI Integration
+- `-host` / `HOST`: bind host (default `0.0.0.0`)
+- `-port` / `PORT`: bind port (default `8000`)
+- `-codec` / `VIDEO_CODEC`: `vp8` (default), `vp9`, `av1`
+- `-bitrate` / `VIDEO_BITRATE_KBPS`: target kbps (default `6000`)
+- `-fps` / `FPS`: frames per second for synthetic source (default `30`)
+- `-width` / `VIDEO_WIDTH`, `-height` / `VIDEO_HEIGHT`: initial/synthetic size (default `1280x720`)
+- `-vp8speed` / `VIDEO_VP8_SPEED`: VP8 `cpu_used` speed (0..8, default 8)
+- `-vp8dropframe` / `VIDEO_VP8_DROPFRAME`: VP8 drop-frame threshold (default 25)
+- `-color` / `NDI_RECV_COLOR`: NDI receive color `bgra` or `uyvy` (Windows + NDI)
+- NDI discovery: `NDI_SOURCE`, `NDI_SOURCE_URL`, `NDI_GROUPS`, `NDI_EXTRA_IPS`
 
-- A minimal ctypes-based integration is provided in `app/ndi_ctypes.py` and wired into `app/tracks/ndi_track.py`.
-- Place `Processing.NDI.Lib.x64.dll` at the repository root (already present) or ensure the NDI library is available on the system path.
-- Discover available sources via HTTP: `GET /ndi/sources` → `{ "sources": ["name1", ...] }`.
-- Select a source by setting `NDI_SOURCE` to a substring of the NDI name (case-insensitive).
-  - When selecting via API, the server stores a stable NDI URL for that source and uses it for new sessions.
 
-Color Formats and Troubleshooting
+## Building
 
-- Default requested format is `UYVY` (YUV 4:2:2). The server converts to RGB internally.
-- If colors look wrong:
-  - Check logs for a line like: `NDI: first frame FourCC='...' ...`.
-  - For 4-channel inputs, set `NDI_INPUT_RGBA_ORDER` to one of `RGBA`, `BGRA`, `ARGB`, `ABGR`, `RGBX`, `BGRX`.
-  - For YUV422, you can force layout via `NDI_INPUT_YUV422_ORDER=UYVY|YUY2` and optionally `NDI_SWAP_UV=1`.
+- Simple build (no native libs; pure‑Go color conversion):
+  - `go build ./cmd/whep`
+- With libvpx + libyuv (recommended CPU path):
+  - `go build -tags "vpx yuv" ./cmd/whep`
+- With AV1 (choose one backend):
+  - SVT‑AV1: `go build -tags "svt yuv" ./cmd/whep`
+  - libaom: `go build -tags "aom yuv" ./cmd/whep`
 
-Runtime control endpoints
+Windows + NDI (cgo) requires the NDI SDK. For reproducible Windows builds and third‑party static libraries, see docs/BUILD.md.
 
-- `GET /ndi/sources`: Lists discoverable NDI source names.
-- `GET /ndi/sources/detail`: Lists discoverable sources with URLs, as `[ { name, url } ]`.
-- `GET /frame`: Captures a single frame from the current source and returns a PNG image (`image/png`). Optional `?timeout=ms` (default 2000).
-- `POST /ndi/select` with body `{ "source": "<substring>" }`: Sets the active NDI source used for new WHEP sessions. Validates against current discovery (best-effort) and returns `{ ok, selected, matched, available }`.
-  - Response includes a `url` field when resolved, which the server uses to lock to the chosen source.
-- `POST /ndi/select_url` with body `{ "url": "ndi://..." }`: Locks selection by NDI URL, bypassing name-based discovery when starting new sessions.
-- `GET /health` (alias: `/healt`): Returns `{ status, sessions: { count, states }, ndi: { selected, selected_url, available } }`.
+More on dependencies and build tags: docs/DEPENDENCIES.md. Architecture overview: docs/ARCHITECTURE.md.
 
-WHEP Semantics Implemented
 
-- `POST /whep` with SDP offer in body → `201 Created` + SDP answer in body. `Location` header gives the session URL for PATCH/DELETE.
-- `PATCH /whep/{id}` accepts trickle ICE payloads but currently no-ops (sufficient for most non-trickle clients).
-- `DELETE /whep/{id}` closes the session.
+## Playing via the included page
 
-Notes
+`standalone-player.html` is a simple WHEP player you can open directly in a browser:
 
-- Audio is not wired by default. The server sends video; you can add audio by implementing an audio track and attaching it in `app/media.py`.
-- This server uses aiortc’s default ICE. For public networks configure `ICE_SERVERS` with your STUN/TURN.
-- NDI is only available when the process can load the NDI runtime. On Windows, the provided `Processing.NDI.Lib.x64.dll` suffices; on Linux/mac, install the appropriate NDI runtime so the shared library can be found.
+- Enter the endpoint (e.g., `http://localhost:8000/whep`)
+- Optional: supply ICE servers (comma separated, e.g., `stun:stun.l.google.com:19302`)
+- Click Play to post an SDP offer and receive the answer
+- The page sets/uses the `Location` resource for proper DELETE on Stop
 
-Standalone Player
+You can also provide `?endpoint=...&ice=...` as URL parameters.
 
-- A single-file player is provided at `standalone-player.html`. You can open it directly in a browser or host it on any static host (GitHub Pages, S3, nginx, etc.).
-- Set the endpoint in the UI or via URL, for example:
-  - `file:///.../standalone-player.html?endpoint=http://localhost:8000/whep`
-  - Add ICE servers via `ice` param (comma-separated): `?ice=stun:stun.l.google.com:19302`
-- When hosting over HTTPS, ensure your WHEP endpoint and ICE servers are also accessible over HTTPS and that CORS is allowed by the WHEP server.
+
+## NDI usage notes (Windows)
+
+- Install the NewTek NDI SDK and ensure headers/libs match the paths in `internal/ndi/receiver_windows.go`.
+- Select a source at runtime using the NDI endpoints or env (`NDI_SOURCE`, `NDI_SOURCE_URL`).
+- Set `NDI_RECV_COLOR` to `BGRA` or `UYVY` (default UYVY). Build with `-tags yuv` for SIMD conversion.
+
+
+## Metrics and health
+
+- `/health` returns JSON with session counts, dropped frames, and runtime stats
+- Startup logs include the active color conversion backend: `libyuv` or `pure-go`
+
+
+## Development tips
+
+- The server restarts the encoder pipeline when the source resolution changes.
+- VP8 has `-vp8speed` and `-vp8dropframe` knobs for realtime tuning.
+- Combine build tags to tailor features, e.g., `-tags "vpx yuv"` or `-tags "svt yuv"`.
+
+
+## License
+
+No license file is included. If you intend to distribute binaries, add an appropriate license and ensure third‑party licenses (libvpx, libyuv, SVT‑AV1, libaom, NDI SDK) are satisfied.
+
