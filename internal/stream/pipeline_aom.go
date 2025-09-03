@@ -83,6 +83,5 @@ func (p *PipelineAV1) Stop() {
     if p == nil { return }
     if atomic.CompareAndSwapInt32(&p.stopped, 0, 1) {
         if p.quit != nil { close(p.quit) }
-        if p.cfg.Source != nil { p.cfg.Source.Stop() }
     }
 }

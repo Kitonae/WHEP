@@ -48,6 +48,7 @@ type session struct {
     sender *webrtc.RTPSender
     track  interface{}
     stop   func()
+    src    stream.Source
 }
 
 func NewWhepServer(cfg Config) *WhepServer {
@@ -270,7 +271,7 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     }
     <-gatherComplete
 
-    sess := &session{pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop}
+    sess := &session{pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop, src: src}
     s.mu.Lock(); s.sessions[id] = sess; s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -396,20 +397,25 @@ func (s *WhepServer) restartSessionPipeline(ss *session) error {
     fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
     // Stop old
     if ss.stop != nil { ss.stop() }
+    // Stop old source to avoid leaking the underlying receiver
+    if ss.src != nil { ss.src.Stop() }
     // Start new (auto-detect size inside pipeline)
     var err error
     switch strings.ToLower(s.cfg.Codec) {
     case "av1":
         if p, e := stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); e == nil {
             ss.stop = p.Stop
+            ss.src = src
         } else { err = e }
     case "vp9":
         if p, e := stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); e == nil {
             ss.stop = p.Stop
+            ss.src = src
         } else { err = e }
     default:
         if p, e := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe}); e == nil {
             ss.stop = p.Stop
+            ss.src = src
         } else { err = e }
     }
     if err != nil { log.Printf("Pipeline restart error: %v", err); return err }
@@ -420,6 +426,7 @@ func (s *WhepServer) closeSession(id string) {
     s.mu.Lock(); sess := s.sessions[id]; delete(s.sessions, id); s.mu.Unlock()
     if sess != nil {
         if sess.stop != nil { sess.stop() }
+        if sess.src != nil { sess.src.Stop() }
         _ = sess.pc.Close()
         log.Printf("WHEP session %s: closed", id)
     }

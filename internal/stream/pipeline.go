@@ -152,7 +152,6 @@ func (p *Pipeline) Stop() {
     close(p.quit)
     _ = p.stdin.Close()
     if p.cmd != nil { _ = p.cmd.Process.Kill(); _ = p.cmd.Wait() }
-    if p.cfg.Source != nil { p.cfg.Source.Stop() }
 }
 
 // --- Synthetic source ---
