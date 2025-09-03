@@ -70,12 +70,19 @@ if not exist "%LIBVPX_PATH%\include\vpx\vpx_encoder.h" (
     set "VPX_AVAILABLE=1"
 )
 
-if not exist "%LIBVPX_PATH%\lib\vpx.lib" (
-    echo [WARN] libvpx library not found at "%LIBVPX_PATH%\lib\vpx.lib"
+set "VPX_LIB_OK=0"
+if exist "%LIBVPX_PATH%\lib\libvpx.a" (
+    echo [✓] libvpx static library found: libvpx.a
+    set "VPX_LIB_OK=1"
+)
+if exist "%LIBVPX_PATH%\lib\vpx.lib" (
+    echo [✓] libvpx import library found: vpx.lib
+    set "VPX_LIB_OK=1"
+)
+if "%VPX_LIB_OK%"=="0" (
+    echo [WARN] libvpx library not found at "%LIBVPX_PATH%\lib\vpx.lib" or "%LIBVPX_PATH%\lib\libvpx.a"
     echo       VP8 encoding will not be available
     set "VPX_AVAILABLE=0"
-) else (
-    echo [✓] libvpx library found (vpx.lib)
 )
 
 rem Check GCC version
