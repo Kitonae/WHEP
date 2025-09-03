@@ -1,8 +1,4 @@
 @echo off
-rem Configure environment for Go CGO build with NDI and libvpx using MinGW-w64
-rem This script uses GCC instead of MSVC to avoid /Werror issues
-rem Usage: build-mingw-auto.bat
-
 setlocal
 
 echo.
@@ -38,6 +34,7 @@ set "NDI_SDK_DIR=C:\Program Files\NDI\NDI 6 SDK"
 set "NDI_INCLUDE=%NDI_SDK_DIR%\Include"
 set "NDI_LIB64=%NDI_SDK_DIR%\Lib\x64"
 set "LIBVPX_PATH=%CD%\3pp\libvpx"
+set "LIBYUV_PATH=%CD%\3pp\libyuv"
 
 rem Dependency checks
 echo Checking dependencies...
@@ -85,6 +82,35 @@ if "%VPX_LIB_OK%"=="0" (
     set "VPX_AVAILABLE=0"
 )
 
+rem Check libyuv
+if not exist "%LIBYUV_PATH%\src" (
+    echo [WARN] libyuv sources not found at "%LIBYUV_PATH%\src"
+    echo       You can fetch with: git clone https://chromium.googlesource.com/libyuv/libyuv "%LIBYUV_PATH%\src"
+    set "YUV_AVAILABLE=0"
+) else (
+    if exist "%LIBYUV_PATH%\src\include\libyuv.h" (
+        echo [✓] libyuv headers found
+        set "YUV_AVAILABLE=1"
+    ) else (
+        echo [WARN] libyuv headers not found under src\include
+        set "YUV_AVAILABLE=0"
+    )
+)
+
+set "YUV_LIB_OK=0"
+if exist "%LIBYUV_PATH%\lib\libyuv.a" (
+    echo [✓] libyuv static library found: libyuv.a
+    set "YUV_LIB_OK=1"
+)
+if exist "%LIBYUV_PATH%\lib\yuv.lib" (
+    echo [✓] libyuv import library found: yuv.lib
+    set "YUV_LIB_OK=1"
+)
+if "%YUV_LIB_OK%"=="0" (
+    echo [WARN] libyuv library not found at "%LIBYUV_PATH%\lib\yuv.lib" or "%LIBYUV_PATH%\lib\libyuv.a"
+    set "YUV_AVAILABLE=0"
+)
+
 rem Check GCC version
 echo [✓] GCC found:
 gcc --version | findstr "gcc"
@@ -104,16 +130,22 @@ rem Try to convert to 8.3 format to avoid spaces
 for %%i in ("%NDI_INCLUDE%") do set "NDI_INCLUDE_SAFE=%%~si"
 for %%i in ("%NDI_LIB64%") do set "NDI_LIB64_SAFE=%%~si"
 for %%i in ("%LIBVPX_PATH%") do set "LIBVPX_PATH_SAFE=%%~si"
+for %%i in ("%LIBYUV_PATH%") do set "LIBYUV_PATH_SAFE=%%~si"
+for %%i in ("%LIBYUV_PATH%\src\include") do set "LIBYUV_INCLUDE_SAFE=%%~si"
+for %%i in ("%LIBYUV_PATH%\lib") do set "LIBYUV_LIB_SAFE=%%~si"
 
 rem Fallback to original if 8.3 conversion fails
 if "%NDI_INCLUDE_SAFE%"=="" set "NDI_INCLUDE_SAFE=%NDI_INCLUDE%"
 if "%NDI_LIB64_SAFE%"=="" set "NDI_LIB64_SAFE=%NDI_LIB64%"
 if "%LIBVPX_PATH_SAFE%"=="" set "LIBVPX_PATH_SAFE=%LIBVPX_PATH%"
+if "%LIBYUV_PATH_SAFE%"=="" set "LIBYUV_PATH_SAFE=%LIBYUV_PATH%"
+if "%LIBYUV_INCLUDE_SAFE%"=="" set "LIBYUV_INCLUDE_SAFE=%LIBYUV_PATH%\src\include"
+if "%LIBYUV_LIB_SAFE%"=="" set "LIBYUV_LIB_SAFE=%LIBYUV_PATH%\lib"
 
 rem CGO flags using safe paths and proper Windows library linking
 rem Add flags for Windows mingw runtime and libvpx
-set "CGO_CFLAGS=-I%NDI_INCLUDE_SAFE% -I%LIBVPX_PATH_SAFE%\include"
-set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%NDI_LIB64_SAFE% -lProcessing.NDI.Lib.x64 -L%LIBVPX_PATH_SAFE%\lib -lvpx -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
+set "CGO_CFLAGS=-I%NDI_INCLUDE_SAFE% -I%LIBVPX_PATH_SAFE%\include -I%LIBYUV_INCLUDE_SAFE%"
+set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%LIBYUV_LIB_SAFE% -L%NDI_LIB64_SAFE% -lProcessing.NDI.Lib.x64 -L%LIBVPX_PATH_SAFE%\lib -lvpx -L%LIBYUV_LIB_SAFE% -lyuv -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
 
 rem Allow all CGO flags (MinGW is more permissive than MSVC)
 set "CGO_CFLAGS_ALLOW=.*"
@@ -121,7 +153,7 @@ set "CGO_LDFLAGS_ALLOW=.*"
 set "CGO_CXXFLAGS_ALLOW=.*"
 
 rem Add runtime library paths
-set "PATH=%CD%;%NDI_LIB64%;%LIBVPX_PATH%\lib;%PATH%"
+set "PATH=%CD%;%NDI_LIB64%;%LIBVPX_PATH%\lib;%LIBYUV_PATH%\lib;%PATH%"
 
 rem Display configuration
 echo.
@@ -133,24 +165,44 @@ echo   NDI_INCLUDE_SAFE=%NDI_INCLUDE_SAFE%
 echo   NDI_LIB64_SAFE=%NDI_LIB64_SAFE%
 echo   LIBVPX_PATH_SAFE=%LIBVPX_PATH_SAFE%
 echo   CGO_CFLAGS=%CGO_CFLAGS%
-echo   CGO_LDFLAGS=%CGO_LDFLAGS%
+  echo   CGO_LDFLAGS=%CGO_LDFLAGS%
+echo   LIBYUV_PATH_SAFE=%LIBYUV_PATH_SAFE%
+  echo   LIBYUV_INCLUDE_SAFE=%LIBYUV_INCLUDE_SAFE%
+  echo   LIBYUV_LIB_SAFE=%LIBYUV_LIB_SAFE%
 echo.
 
 echo Building executable with NDI + VP8 support...
 if "%VPX_AVAILABLE%"=="0" (
     echo [WARN] libvpx not available, building NDI-only version instead
-    go build -v -o whep.exe ./cmd/whep
+    if "%YUV_AVAILABLE%"=="1" (
+        echo [INFO] libyuv present, enabling yuv tag
+        go build -v -tags yuv -o whep.exe ./cmd/whep
+    ) else (
+        go build -v -o whep.exe ./cmd/whep
+    )
 ) else (
-    go build -v -tags vpx -o whep.exe ./cmd/whep
+    if "%YUV_AVAILABLE%"=="1" (
+        go build -v -tags "vpx yuv" -o whep.exe ./cmd/whep
+    ) else (
+        go build -v -tags vpx -o whep.exe ./cmd/whep
+    )
 )
 
 if %ERRORLEVEL% equ 0 (
     echo.
     echo ✓ Build successful: whep.exe
     if "%VPX_AVAILABLE%"=="1" (
-        echo ✓ Features: NDI streaming + VP8 encoding
+        if "%YUV_AVAILABLE%"=="1" (
+            echo ✓ Features: NDI streaming + VP8 encoding + libyuv conversions
+        ) else (
+            echo ✓ Features: NDI streaming + VP8 encoding
+        )
     ) else (
-        echo ✓ Features: NDI streaming only
+        if "%YUV_AVAILABLE%"=="1" (
+            echo ✓ Features: NDI streaming + libyuv conversions
+        ) else (
+            echo ✓ Features: NDI streaming only
+        )
     )
     echo ✓ Compiler: MinGW-w64 GCC
 ) else (

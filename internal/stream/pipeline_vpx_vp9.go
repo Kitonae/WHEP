@@ -9,27 +9,27 @@ import (
     "github.com/pion/webrtc/v3/pkg/media"
 )
 
-// StartVP8Pipeline encodes BGRA frames from Source using libvpx and feeds a Pion VP8 track.
-func StartVP8Pipeline(cfg PipelineConfig) (*PipelineVP8, error) {
+// StartVP9Pipeline encodes BGRA/UYVY frames from Source using libvpx VP9 and feeds a Pion VP9 track.
+func StartVP9Pipeline(cfg PipelineConfig) (*PipelineVP9, error) {
     if cfg.FPS <= 0 { cfg.FPS = 30 }
     if cfg.Width <= 0 { cfg.Width = 1280 }
     if cfg.Height <= 0 { cfg.Height = 720 }
     if cfg.Source == nil {
         cfg.Source = NewSynthetic(cfg.Width, cfg.Height, cfg.FPS, 1)
     }
-    p := &PipelineVP8{cfg: cfg}
+    p := &PipelineVP9{cfg: cfg}
     if err := p.start(); err != nil { return nil, err }
     return p, nil
 }
 
-type PipelineVP8 struct {
+type PipelineVP9 struct {
     cfg PipelineConfig
-    enc *VP8Encoder
+    enc *VP9Encoder
     quit chan struct{}
     stopped int32 // 0 active, 1 stopped
 }
 
-func (p *PipelineVP8) start() error {
+func (p *PipelineVP9) start() error {
     // If source can report dimensions, prefer those over configured width/height
     if p.cfg.Source != nil {
         if s, ok := p.cfg.Source.(sourceWithLast); ok {
@@ -43,9 +43,9 @@ func (p *PipelineVP8) start() error {
             }
         }
     }
-bk := p.cfg.BitrateKbps
+    bk := p.cfg.BitrateKbps
     if bk <= 0 { bk = 6000 }
-    e, err := NewVP8Encoder(VP8Config{Width: p.cfg.Width, Height: p.cfg.Height, FPS: p.cfg.FPS, BitrateKbps: bk, Speed: p.cfg.VP8Speed, Dropframe: p.cfg.VP8Dropframe})
+    e, err := NewVP9Encoder(VP9Config{Width: p.cfg.Width, Height: p.cfg.Height, FPS: p.cfg.FPS, BitrateKbps: bk})
     if err != nil { return err }
     p.enc = e
     p.quit = make(chan struct{})
@@ -53,7 +53,7 @@ bk := p.cfg.BitrateKbps
     return nil
 }
 
-func (p *PipelineVP8) loop() {
+func (p *PipelineVP9) loop() {
     defer p.enc.Close()
     y := make([]byte, p.cfg.Width*p.cfg.Height)
     u := make([]byte, (p.cfg.Width/2)*(p.cfg.Height/2))
@@ -73,7 +73,6 @@ func (p *PipelineVP8) loop() {
         if !ok { return }
         switch pixfmt {
         case "uyvy422":
-            // Expect packed 4:2:2 (2 bytes per pixel)
             if len(frame) < p.cfg.Width*p.cfg.Height*2 { continue }
             UYVYtoI420(frame, p.cfg.Width, p.cfg.Height, y, u, v)
         default: // bgra
@@ -92,10 +91,11 @@ func (p *PipelineVP8) loop() {
     }
 }
 
-func (p *PipelineVP8) Stop() {
+func (p *PipelineVP9) Stop() {
     if p == nil { return }
     if atomic.CompareAndSwapInt32(&p.stopped, 0, 1) {
         if p.quit != nil { close(p.quit) }
         if p.cfg.Source != nil { p.cfg.Source.Stop() }
     }
 }
+

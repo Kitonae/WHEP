@@ -28,6 +28,10 @@ type Config struct {
     Width  int
     Height int
     BitrateKbps int
+    Codec  string // "vp8" (default) or "vp9"
+    HWAccel string // reserved for HW encoders (not used by AV1 here)
+    VP8Speed int
+    VP8Dropframe int
 }
 
 type WhepServer struct {
@@ -49,7 +53,10 @@ type session struct {
 func NewWhepServer(cfg Config) *WhepServer {
     // Start background NDI discovery so API can serve cached results immediately
     ndi.StartBackgroundDiscovery()
-    return &WhepServer{cfg: cfg, sessions: map[string]*session{}}
+    s := &WhepServer{cfg: cfg, sessions: map[string]*session{}}
+    // Preflight logs
+    log.Printf("Color conversion: %s", stream.ColorConversionImpl())
+    return s
 }
 
 func (s *WhepServer) RegisterRoutes(mux *http.ServeMux) {
@@ -104,8 +111,21 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     id := uuid.New().String()
     log.Printf("WHEP session %s: created", id)
 
-    // Create a VP8 track (we'll encode using libvpx via cgo)
-    videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", "pion")
+    // Create a video track matching the selected codec
+    codec := strings.ToLower(s.cfg.Codec)
+    mime := webrtc.MimeTypeVP8
+    switch codec {
+    case "vp9":
+        mime = webrtc.MimeTypeVP9
+    case "av1":
+        mime = webrtc.MimeTypeAV1
+    default:
+        codec = "vp8"
+        mime = webrtc.MimeTypeVP8
+    }
+    videoTrack, err := webrtc.NewTrackLocalStaticSample(
+        webrtc.RTPCodecCapability{MimeType: mime}, "video", "pion",
+    )
     if err != nil {
         _ = pc.Close()
         http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -133,22 +153,57 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
             log.Printf("NDI source unavailable (%v), falling back to synthetic", err)
         }
     }
-    // Start VP8 pipeline (no H.264 fallback)
+    // Start AV1/VP9/VP8 pipeline (no H.264 fallback here)
     var stopper interface{ Stop() }
-    pipeVP8, err := stream.StartVP8Pipeline(stream.PipelineConfig{
-        Width:  s.cfg.Width,
-        Height: s.cfg.Height,
-        FPS:    fps,
-        BitrateKbps: s.cfg.BitrateKbps,
-        Source: src,
-        Track:  videoTrack,
-    })
-    if err != nil {
-        _ = pc.Close()
-        http.Error(w, fmt.Sprintf("VP8 pipeline error: %v", err), http.StatusInternalServerError)
-        return
+    switch codec {
+    case "av1":
+        pipeAV1, err := stream.StartAV1Pipeline(stream.PipelineConfig{
+            Width:  s.cfg.Width,
+            Height: s.cfg.Height,
+            FPS:    fps,
+            BitrateKbps: s.cfg.BitrateKbps,
+            Source: src,
+            Track:  videoTrack,
+        })
+        if err != nil {
+            _ = pc.Close()
+            http.Error(w, fmt.Sprintf("AV1 pipeline error: %v", err), http.StatusInternalServerError)
+            return
+        }
+        stopper = pipeAV1
+    case "vp9":
+        pipeVP9, err := stream.StartVP9Pipeline(stream.PipelineConfig{
+            Width:  s.cfg.Width,
+            Height: s.cfg.Height,
+            FPS:    fps,
+            BitrateKbps: s.cfg.BitrateKbps,
+            Source: src,
+            Track:  videoTrack,
+        })
+        if err != nil {
+            _ = pc.Close()
+            http.Error(w, fmt.Sprintf("VP9 pipeline error: %v", err), http.StatusInternalServerError)
+            return
+        }
+        stopper = pipeVP9
+    default: // vp8
+        pipeVP8, err := stream.StartVP8Pipeline(stream.PipelineConfig{
+            Width:  s.cfg.Width,
+            Height: s.cfg.Height,
+            FPS:    fps,
+            BitrateKbps: s.cfg.BitrateKbps,
+            Source: src,
+            Track:  videoTrack,
+            VP8Speed: s.cfg.VP8Speed,
+            VP8Dropframe: s.cfg.VP8Dropframe,
+        })
+        if err != nil {
+            _ = pc.Close()
+            http.Error(w, fmt.Sprintf("VP8 pipeline error: %v", err), http.StatusInternalServerError)
+            return
+        }
+        stopper = pipeVP8
     }
-    stopper = pipeVP8
 
     // Monitor for source resolution changes and restart pipeline when needed
     type sourceWithLast interface{ Last() ([]byte,int,int,bool) }
@@ -169,7 +224,16 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
                     pipeMu.Lock()
                     if stopper != nil { stopper.Stop() }
                     var newStop interface{ Stop() }
-                    p, err := stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                    var p interface{ Stop() }
+                    var err error
+                    switch codec {
+                    case "vp9":
+                        p, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                    case "av1":
+                        p, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
+                    default:
+                        p, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
+                    }
                     newStop = p
                     if err != nil {
                         log.Printf("Pipeline: restart failed: %v", err)
@@ -328,17 +392,27 @@ func (s *WhepServer) restartSessionPipeline(ss *session) error {
         // fallback to synthetic if NDI unavailable
         src = nil
     }
-    // Restart VP8 pipeline only
+    // Restart video pipeline only, using current codec
     fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
     // Stop old
     if ss.stop != nil { ss.stop() }
     // Start new (auto-detect size inside pipeline)
-    if p, err := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); err == nil {
-        ss.stop = p.Stop
-    } else {
-        log.Printf("Pipeline restart error: %v", err)
-        return err
+    var err error
+    switch strings.ToLower(s.cfg.Codec) {
+    case "av1":
+        if p, e := stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); e == nil {
+            ss.stop = p.Stop
+        } else { err = e }
+    case "vp9":
+        if p, e := stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track}); e == nil {
+            ss.stop = p.Stop
+        } else { err = e }
+    default:
+        if p, e := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe}); e == nil {
+            ss.stop = p.Stop
+        } else { err = e }
     }
+    if err != nil { log.Printf("Pipeline restart error: %v", err); return err }
     return nil
 }
 

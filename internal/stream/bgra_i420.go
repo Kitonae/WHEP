@@ -1,3 +1,5 @@
+//go:build !yuv
+
 package stream
 
 // BGRAtoI420 converts a BGRA frame (w*h*4) to planar I420 (y, u, v).
@@ -38,4 +40,3 @@ func BGRAtoI420(bgra []byte, w, h int, y, u, v []byte) {
 }
 
 func clamp8(x int) byte { if x < 0 { return 0 }; if x > 255 { return 255 }; return byte(x) }
-

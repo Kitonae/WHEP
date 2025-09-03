@@ -20,6 +20,9 @@ type PipelineConfig struct {
     Source        Source
     // Track expects a Pion track with WriteSample(media.Sample) (e.g., *webrtc.TrackLocalStaticSample).
     Track         interface{}
+    // Optional VP8 tuning (ignored by other codecs)
+    VP8Speed      int // maps to libvpx VP8E_SET_CPUUSED
+    VP8Dropframe  int // maps to rc_dropframe_thresh
 }
 
 // optional capability: source can advertise its pixel format (e.g., "bgra", "uyvy422")

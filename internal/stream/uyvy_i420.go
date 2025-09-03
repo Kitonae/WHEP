@@ -1,3 +1,5 @@
+//go:build !yuv
+
 package stream
 
 // UYVYtoI420 converts packed UYVY 4:2:2 (2 bytes per pixel) to planar I420 4:2:0.
