@@ -177,7 +177,11 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
     if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
     if ndiURL != "" || ndiName != "" {
-        if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
+        if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") {
+            // Special fake NDI source that maps to synthetic generator
+            log.Printf("Using fake NDI source 'Splash' -> synthetic")
+            src = nil // nil signals pipelines to use synthetic
+        } else if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
             log.Printf("Using NDI source (url=%v, name=%v)", ndiURL != "", ndiName)
             src = nd
         } else {
@@ -218,6 +222,8 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
         }
         stopper = pipeVP9
     default: // vp8
+        df := s.cfg.VP8Dropframe
+        if src == nil { df = 0 } // ensure synthetic "Splash" animates reliably
         pipeVP8, err := stream.StartVP8Pipeline(stream.PipelineConfig{
             Width:  s.cfg.Width,
             Height: s.cfg.Height,
@@ -226,7 +232,7 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
             Source: src,
             Track:  videoTrack,
             VP8Speed: s.cfg.VP8Speed,
-            VP8Dropframe: s.cfg.VP8Dropframe,
+            VP8Dropframe: df,
         })
         if err != nil {
             _ = pc.Close()
@@ -371,7 +377,9 @@ func (s *WhepServer) handleNDISources(w http.ResponseWriter, r *http.Request) {
     type Info struct{ Name string `json:"name"`; URL string `json:"url"` }
     // Serve from cache immediately for responsiveness
     srcs := ndi.GetCachedSources()
-    list := make([]Info, 0, len(srcs))
+    list := make([]Info, 0, len(srcs)+1)
+    // Inject fake source "Splash" which maps to the synthetic generator
+    list = append(list, Info{Name: "Splash", URL: "ndi://Splash"})
     for _, si := range srcs { list = append(list, Info{Name: si.Name, URL: si.URL}) }
     _ = json.NewEncoder(w).Encode(map[string]any{"sources": list})
 }
@@ -426,7 +434,7 @@ func (s *WhepServer) handleNDISelectURL(w http.ResponseWriter, r *http.Request) 
 
 // helper to get NDI discovery results via cgo wrapper; returns empty list when unavailable
 func streamNDISources() []struct{ Name, URL string } {
-    out := []struct{ Name, URL string }{}
+    out := []struct{ Name, URL string }{{Name: "Splash", URL: "ndi://Splash"}}
     // Use cached sources from background discovery
     for _, s := range ndi.GetCachedSources() {
         out = append(out, struct{ Name, URL string }{Name: s.Name, URL: s.URL})
@@ -463,7 +471,9 @@ func (s *WhepServer) restartSessionPipeline(ss *session) error {
     if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
     if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
     var src stream.Source
-    if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
+    if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") {
+        src = nil // use synthetic
+    } else if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
         src = nd
     } else {
         // fallback to synthetic if NDI unavailable
@@ -489,7 +499,9 @@ func (s *WhepServer) restartSessionPipeline(ss *session) error {
             ss.src = src
         } else { err = e }
     default:
-        if p, e := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe}); e == nil {
+        df := s.cfg.VP8Dropframe
+        if src == nil { df = 0 }
+        if p, e := stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:ss.track, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df}); e == nil {
             ss.stop = p.Stop
             ss.src = src
         } else { err = e }
@@ -530,6 +542,30 @@ func (s *WhepServer) handleFramePNG(w http.ResponseWriter, r *http.Request) {
     s.mu.Lock(); ndiURL := s.ndiURL; ndiName := s.ndiName; s.mu.Unlock()
     if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
     if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
+
+    // If the special fake NDI "Splash" is selected, render a synthetic frame instead
+    if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") {
+        wpx, hpx := s.cfg.Width, s.cfg.Height
+        if wpx <= 0 { wpx = 1280 }
+        if hpx <= 0 { hpx = 720 }
+        src := stream.NewSynthetic(wpx, hpx, 30, 1)
+        buf, _ := src.Next()
+        img := image.NewRGBA(image.Rect(0,0,wpx,hpx))
+        for y := 0; y < hpx; y++ {
+            for x := 0; x < wpx; x++ {
+                si := (y*wpx + x) * 4
+                di := si
+                b := buf[si+0]; g := buf[si+1]; r := buf[si+2]; a := buf[si+3]
+                img.Pix[di+0] = r
+                img.Pix[di+1] = g
+                img.Pix[di+2] = b
+                img.Pix[di+3] = a
+            }
+        }
+        w.Header().Set("Content-Type", "image/png")
+        _ = png.Encode(w, img)
+        return
+    }
 
     // Create a temporary NDI source
     nd, err := stream.NewNDISource(ndiURL, ndiName)

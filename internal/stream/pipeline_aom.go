@@ -66,6 +66,8 @@ func (p *PipelineAV1) loop() {
     if pixfmt == "" { pixfmt = "bgra" }
     ticker := time.NewTicker(time.Second / time.Duration(p.cfg.FPS))
     defer ticker.Stop()
+    enqueue, stopWriter := newAsyncSampleWriter(p.cfg.Track)
+    defer stopWriter()
     for {
         select { case <-p.quit: return; case <-ticker.C: }
         frame, ok := p.cfg.Source.Next(); if !ok { return }
@@ -81,13 +83,14 @@ func (p *PipelineAV1) loop() {
         packets, key, err := p.enc.EncodeI420(y,u,v); if err != nil { return }
         dur := time.Second / time.Duration(p.cfg.FPS)
         if len(packets) == 0 { incFramesDropped() } else { incFramesEncoded() }
+        accepted := 0
         for _, au := range packets {
-            if w, ok := p.cfg.Track.(interface{ WriteSample(media.Sample) error }); ok {
-                _ = w.WriteSample(media.Sample{Data: au, Duration: dur, Timestamp: time.Now()})
+            if enqueue(media.Sample{Data: au, Duration: dur, Timestamp: time.Now()}) {
+                accepted++
             }
             _ = key
         }
-        incSamplesSent(len(packets))
+        incSamplesSent(accepted)
     }
 }
 
