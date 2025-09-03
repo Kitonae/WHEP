@@ -57,6 +57,8 @@ func NewWhepServer(cfg Config) *WhepServer {
     s := &WhepServer{cfg: cfg, sessions: map[string]*session{}}
     // Preflight logs
     log.Printf("Color conversion: %s", stream.ColorConversionImpl())
+    // Reset metrics at startup
+    stream.ResetCounters()
     return s
 }
 
@@ -67,12 +69,16 @@ func (s *WhepServer) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/ndi/select", s.handleNDISelect)
     mux.HandleFunc("/ndi/select_url", s.handleNDISelectURL)
     mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        s.mu.Lock(); name,url := s.ndiName, s.ndiURL; s.mu.Unlock()
-        _ = json.NewEncoder(w).Encode(map[string]any{
-            "status": "ok",
-            "sessions": len(s.sessions),
-            "ndi": map[string]any{"selected": name, "url": url},
-        })
+        s.mu.Lock(); name,url := s.ndiName, s.ndiURL; sessCount := len(s.sessions); s.mu.Unlock()
+        metrics := stream.GetCounters()
+        out := map[string]any{
+            "status":   "ok",
+            "sessions": sessCount,
+            "ndi":      map[string]any{"selected": name, "url": url},
+            "metrics":  metrics,
+        }
+        if v, ok := metrics["frames_dropped"]; ok { out["dropped_frames"] = v }
+        _ = json.NewEncoder(w).Encode(out)
     })
     mux.HandleFunc("/frame", s.handleFramePNG)
     mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

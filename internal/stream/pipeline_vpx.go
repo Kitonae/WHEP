@@ -70,6 +70,7 @@ func (p *PipelineVP8) loop() {
     for {
         select { case <-p.quit: return; case <-ticker.C: }
         frame, ok := p.cfg.Source.Next()
+        incFramesIn()
         if !ok { return }
         switch pixfmt {
         case "uyvy422":
@@ -83,12 +84,14 @@ func (p *PipelineVP8) loop() {
         packets, key, err := p.enc.EncodeI420(y, u, v)
         if err != nil { return }
         dur := time.Second / time.Duration(p.cfg.FPS)
+        if len(packets) == 0 { incFramesDropped() } else { incFramesEncoded() }
         for _, au := range packets {
             if w, ok := p.cfg.Track.(interface{ WriteSample(media.Sample) error }); ok {
                 _ = w.WriteSample(media.Sample{Data: au, Duration: dur, Timestamp: time.Now()})
             }
             _ = key
         }
+        incSamplesSent(len(packets))
     }
 }
 
