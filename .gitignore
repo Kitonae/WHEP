@@ -182,7 +182,7 @@ coverage/
 vendor/
 
 # Local third-party source/vendor bundle
-/3pp/
+3pp/
 
 # Generated files
 *_generated.go
