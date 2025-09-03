@@ -1,3 +1,0 @@
-"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\yuvconstants.dir/objects.a
-C:\msys64\mingw64\bin\ar.exe qc CMakeFiles\yuvconstants.dir/objects.a @CMakeFiles\yuvconstants.dir\objects1.rsp
-C:\msys64\mingw64\bin\g++.exe -O3 -DNDEBUG -Wl,--whole-archive CMakeFiles\yuvconstants.dir/objects.a -Wl,--no-whole-archive -o yuvconstants.exe -Wl,--out-implib,libyuvconstants.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\yuvconstants.dir\linkLibs.rsp
