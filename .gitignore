@@ -181,6 +181,9 @@ coverage/
 # Third-party dependencies (if not using go modules)
 vendor/
 
+# Local third-party source/vendor bundle
+/3pp/
+
 # Generated files
 *_generated.go
 *.pb.go
