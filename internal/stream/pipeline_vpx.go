@@ -30,8 +30,8 @@ type PipelineVP8 struct {
 }
 
 func (p *PipelineVP8) start() error {
-    // If source can report dimensions, prefer those over configured width/height
-    if p.cfg.Source != nil {
+    // If target width/height not set, and source can report dimensions, adopt source dimensions.
+    if (p.cfg.Width <= 0 || p.cfg.Height <= 0) && p.cfg.Source != nil {
         if s, ok := p.cfg.Source.(sourceWithLast); ok {
             deadline := time.Now().Add(1 * time.Second)
             for time.Now().Before(deadline) {
@@ -64,9 +64,10 @@ func (p *PipelineVP8) loop() {
     // Track active encoder lifecycle
     defer unregisterPipeline("vp8")
     defer p.enc.Close()
-    y := make([]byte, p.cfg.Width*p.cfg.Height)
-    u := make([]byte, (p.cfg.Width/2)*(p.cfg.Height/2))
-    v := make([]byte, (p.cfg.Width/2)*(p.cfg.Height/2))
+    dstW, dstH := p.cfg.Width, p.cfg.Height
+    y := make([]byte, dstW*dstH)
+    u := make([]byte, (dstW/2)*(dstH/2))
+    v := make([]byte, (dstW/2)*(dstH/2))
     // Detect source pixel format if provided
     var pixfmt string
     if pf, ok := p.cfg.Source.(interface{ PixFmt() string }); ok {
@@ -78,19 +79,43 @@ func (p *PipelineVP8) loop() {
     defer ticker.Stop()
     enqueue, stopWriter := newAsyncSampleWriter(p.cfg.Track)
     defer stopWriter()
+    var srcW, srcH int
+    var ySrc, uSrc, vSrc []byte
     for {
         select { case <-p.quit: return; case <-ticker.C: }
         frame, ok := p.cfg.Source.Next()
         incFramesIn()
         if !ok { return }
+        // Determine source dimensions if available
+        if s, ok := p.cfg.Source.(sourceWithLast); ok {
+            if _, w0, h0, ok2 := s.Last(); ok2 && w0 > 0 && h0 > 0 {
+                if w0 != srcW || h0 != srcH {
+                    srcW, srcH = w0, h0
+                    ySrc = make([]byte, srcW*srcH)
+                    uSrc = make([]byte, (srcW/2)*(srcH/2))
+                    vSrc = make([]byte, (srcW/2)*(srcH/2))
+                }
+            }
+        }
+        if srcW <= 0 || srcH <= 0 { srcW, srcH = dstW, dstH; ySrc, uSrc, vSrc = y, u, v }
         switch pixfmt {
         case "uyvy422":
-            // Expect packed 4:2:2 (2 bytes per pixel)
-            if len(frame) < p.cfg.Width*p.cfg.Height*2 { continue }
-            UYVYtoI420(frame, p.cfg.Width, p.cfg.Height, y, u, v)
+            // Expect packed 4:2:2 (2 bytes per pixel) from source
+            if len(frame) < srcW*srcH*2 { continue }
+            if srcW == dstW && srcH == dstH {
+                UYVYtoI420(frame, srcW, srcH, y, u, v)
+            } else {
+                UYVYtoI420(frame, srcW, srcH, ySrc, uSrc, vSrc)
+                I420Scale(ySrc, uSrc, vSrc, srcW, srcH, y, u, v, dstW, dstH)
+            }
         default: // bgra
-            if len(frame) < p.cfg.Width*p.cfg.Height*4 { continue }
-            BGRAtoI420(frame, p.cfg.Width, p.cfg.Height, y, u, v)
+            if len(frame) < srcW*srcH*4 { continue }
+            if srcW == dstW && srcH == dstH {
+                BGRAtoI420(frame, srcW, srcH, y, u, v)
+            } else {
+                BGRAtoI420(frame, srcW, srcH, ySrc, uSrc, vSrc)
+                I420Scale(ySrc, uSrc, vSrc, srcW, srcH, y, u, v, dstW, dstH)
+            }
         }
         packets, key, err := p.enc.EncodeI420(y, u, v)
         if err != nil { return }

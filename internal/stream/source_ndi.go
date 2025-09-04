@@ -17,6 +17,7 @@ type NDISource struct {
     quit chan struct{}
     firstLogged bool
     pixfmt string // "bgra" or "uyvy422"
+    stopped int32 // atomic flag to make Stop idempotent
 }
 
 // NewNDISource selects a source by URL if provided, else by name substring, else first available.
@@ -143,7 +144,12 @@ func (s *NDISource) PixFmt() string {
     return s.pixfmt
 }
 
-func (s *NDISource) Stop() { close(s.quit); s.rx.Close() }
+func (s *NDISource) Stop() {
+    if atomic.CompareAndSwapInt32(&s.stopped, 0, 1) {
+        close(s.quit)
+        s.rx.Close()
+    }
+}
 
 // tiny error without importing fmt
 type tinyErr string

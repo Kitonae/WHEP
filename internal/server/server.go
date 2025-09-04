@@ -77,6 +77,10 @@ type ndiMount struct {
     name      string
     url       string
     codec     string
+    width     int
+    height    int
+    fps       int
+    bitrateKbps int
     bc        *stream.SampleBroadcaster
     stop      func()
     src       stream.Source
@@ -84,6 +88,8 @@ type ndiMount struct {
     mu        sync.Mutex
     sessions  map[string]struct{}
     idleTimer *time.Timer
+    noSessTimer *time.Timer
+    created   time.Time
 }
 
 func (m *ndiMount) refCount() int {
@@ -97,6 +103,7 @@ func (m *ndiMount) addSession(id string) {
     if m.sessions == nil { m.sessions = make(map[string]struct{}) }
     m.sessions[id] = struct{}{}
     if m.idleTimer != nil { m.idleTimer.Stop(); m.idleTimer = nil }
+    if m.noSessTimer != nil { m.noSessTimer.Stop(); m.noSessTimer = nil }
     m.mu.Unlock()
 }
 
@@ -258,7 +265,8 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     <-gatherComplete
 
     // Register session (no per-session encoder; we rely on shared pipeline)
-    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: s.shareSrc, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach }
+    // For legacy shared pipeline, avoid storing shared src/stop in session to prevent double-stop
+    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: nil, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach }
     s.mu.Lock(); s.sessions[id] = sess; s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -307,7 +315,7 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
     // Session resource path?
     parts := strings.Split(path, "/")
     if len(parts) >= 3 && parts[1] == "sessions" {
-        key := parts[0]
+        // key := parts[0] // not needed; session close handles mount lookup
         id := parts[2]
         switch r.Method {
         case http.MethodPatch:
@@ -316,12 +324,6 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
             return
         case http.MethodDelete:
             s.closeSession(id)
-            // Also update mount refcount idle handling
-            s.mu.Lock()
-            if m := s.mounts[key]; m != nil {
-                m.removeSession(id, func() { s.teardownMountIfIdle(key) })
-            }
-            s.mu.Unlock()
             w.WriteHeader(http.StatusNoContent)
             return
         case http.MethodOptions:
@@ -333,7 +335,7 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
         }
     }
 
-    // Mount create (POST /whep/ndi/{key})
+    // Mount create (POST /whep/ndi/{key}?w=&h=&fps=&bitrateKbps=)
     if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
     if r.Method != http.MethodPost {
         http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -349,8 +351,15 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Ensure a mount exists for this key
-    m, err := s.ensureMount(key)
+    // Parse variant constraints from query params
+    q := r.URL.Query()
+    wantW, wantH, wantFPS, wantBR := 0, 0, 0, 0
+    if v := q.Get("w"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { wantW = n } }
+    if v := q.Get("h"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { wantH = n } }
+    if v := q.Get("fps"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { wantFPS = n } }
+    if v := q.Get("bitrateKbps"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { wantBR = n } }
+    // Ensure a mount exists for this source+variant
+    m, err := s.ensureMount(key, wantW, wantH, wantFPS, wantBR)
     if err != nil {
         http.Error(w, err.Error(), http.StatusNotFound)
         return
@@ -384,8 +393,9 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
     if err := pc.SetLocalDescription(answer); err != nil { _ = pc.Close(); http.Error(w, err.Error(), http.StatusInternalServerError); return }
     <-gatherComplete
 
-    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: m.src, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach, mountKey: key }
-    s.mu.Lock(); s.sessions[id] = sess; if mm := s.mounts[key]; mm != nil { mm.addSession(id) }
+    // For mount sessions, do not retain shared src/stop on the session to avoid double stops
+    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: nil, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach, mountKey: m.key }
+    s.mu.Lock(); s.sessions[id] = sess; if mm := s.mounts[m.key]; mm != nil { mm.addSession(id) }
     s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -393,20 +403,30 @@ func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
         s.mu.Lock(); if ss, ok := s.sessions[id]; ok { ss.state = state.String() }; s.mu.Unlock()
         if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateDisconnected {
             s.closeSession(id)
-            s.mu.Lock(); if mm := s.mounts[key]; mm != nil { mm.removeSession(id, func(){ s.teardownMountIfIdle(key) }) }; s.mu.Unlock()
         }
     })
 
     w.Header().Set("Content-Type", "application/sdp")
+    // Reflect actual encoder settings
+    m.mu.Lock(); actualW, actualH, actualFPS, actualBR := m.width, m.height, m.fps, m.bitrateKbps; m.mu.Unlock()
+    if actualW > 0 && actualH > 0 { w.Header().Set("X-Resolution", fmt.Sprintf("%dx%d@%d", actualW, actualH, actualFPS)) }
+    if actualBR > 0 { w.Header().Set("X-Bitrate-Kbps", fmt.Sprintf("%d", actualBR)) }
     w.Header().Set("Location", fmt.Sprintf("/whep/ndi/%s/sessions/%s", key, id))
     w.WriteHeader(http.StatusCreated)
     _, _ = io.WriteString(w, pc.LocalDescription().SDP)
 }
 
 // ensureMount ensures a per-source shared pipeline exists for the given key.
-func (s *WhepServer) ensureMount(key string) (*ndiMount, error) {
+func (s *WhepServer) ensureMount(key string, wantW, wantH, wantFPS, wantBR int) (*ndiMount, error) {
     s.mu.Lock()
-    if m, ok := s.mounts[key]; ok && m.bc != nil {
+    // Compose composite key for variant reuse
+    if wantFPS <= 0 { wantFPS = s.cfg.FPS; if wantFPS <= 0 { wantFPS = 30 } }
+    if wantBR <= 0 { wantBR = s.cfg.BitrateKbps }
+    compKey := key
+    if wantW > 0 || wantH > 0 || wantFPS > 0 || wantBR > 0 {
+        compKey = fmt.Sprintf("%s|w%d|h%d|f%d|b%d", key, wantW, wantH, wantFPS, wantBR)
+    }
+    if m, ok := s.mounts[compKey]; ok && m.bc != nil {
         s.mu.Unlock()
         return m, nil
     }
@@ -418,8 +438,8 @@ func (s *WhepServer) ensureMount(key string) (*ndiMount, error) {
         return nil, fmt.Errorf("source not found: %s", key)
     }
     // Create new mount and start pipeline
-    m := &ndiMount{ key: key, name: si.Name, url: si.URL, codec: strings.ToLower(s.cfg.Codec), bc: stream.NewSampleBroadcaster(), sessions: map[string]struct{}{} }
-    s.mounts[key] = m
+    m := &ndiMount{ key: compKey, name: si.Name, url: si.URL, codec: strings.ToLower(s.cfg.Codec), bc: stream.NewSampleBroadcaster(), sessions: map[string]struct{}{}, width: wantW, height: wantH, fps: wantFPS, bitrateKbps: wantBR, created: time.Now() }
+    s.mounts[compKey] = m
     s.mu.Unlock()
 
     // Build NDI Source (nil for Splash synthetic)
@@ -433,23 +453,28 @@ func (s *WhepServer) ensureMount(key string) (*ndiMount, error) {
         src = nil
     }
 
-    fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
+    fps := m.fps; if fps <= 0 { fps = s.cfg.FPS; if fps <= 0 { fps = 30 } }
+    width := m.width; if width <= 0 { width = s.cfg.Width }
+    height := m.height; if height <= 0 { height = s.cfg.Height }
+    br := m.bitrateKbps; if br <= 0 { br = s.cfg.BitrateKbps }
     var stopper interface{ Stop() }
     var err error
     switch m.codec {
     case "av1":
-        stopper, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+        stopper, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:width, Height:height, FPS:fps, BitrateKbps:br, Source:src, Track:m.bc})
     case "vp9":
-        stopper, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+        stopper, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:width, Height:height, FPS:fps, BitrateKbps:br, Source:src, Track:m.bc})
     default:
         df := s.cfg.VP8Dropframe; if src == nil { df = 0 }
-        stopper, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df})
+        stopper, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:width, Height:height, FPS:fps, BitrateKbps:br, Source:src, Track:m.bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df})
     }
     if err != nil { return nil, fmt.Errorf("mount start: %w", err) }
 
     // Monitor source resolution for restarts
     ctx, cancel := context.WithCancel(context.Background())
-    if src != nil {
+    // If explicit target width/height provided, we avoid restarting on source resolution change;
+    // the encoder/pipeline handles scaling. Otherwise, monitor and restart.
+    if src != nil && (m.width == 0 || m.height == 0) {
         if reporter, ok := src.(interface{ Last()([]byte,int,int,bool) }); ok {
             currentW, currentH := s.cfg.Width, s.cfg.Height
             go func() {
@@ -475,13 +500,23 @@ func (s *WhepServer) ensureMount(key string) (*ndiMount, error) {
                         }
                         if e != nil { log.Printf("Pipeline(mount %s) restart failed: %v", key, e); continue }
                         stopper = p
+                        // Update mount stop handle to point to the new pipeline
+                        m.mu.Lock()
+                        m.stop = stopper.Stop
+                        m.mu.Unlock()
                         currentW, currentH = w0, h0
                     }
                 }
             }()
         }
     }
-    m.mu.Lock(); m.src = src; m.stop = stopper.Stop; m.cancel = cancel; m.mu.Unlock()
+    m.mu.Lock(); m.src = src; m.stop = stopper.Stop; m.cancel = cancel
+    // Schedule provisional teardown if no session attaches shortly
+    if len(m.sessions) == 0 && m.noSessTimer == nil {
+        keyForTimer := m.key
+        m.noSessTimer = time.AfterFunc(30*time.Second, func(){ s.teardownMountIfIdle(keyForTimer) })
+    }
+    m.mu.Unlock()
     return m, nil
 }
 
@@ -498,6 +533,8 @@ func (s *WhepServer) teardownMountIfIdle(key string) {
     m.bc, m.stop, m.src, m.cancel = nil, nil, nil, nil
     m.mu.Unlock()
     log.Printf("Mount %s torn down (idle)", key)
+    // Remove mount entry to avoid stale references
+    s.mu.Lock(); delete(s.mounts, key); s.mu.Unlock()
 }
 
 // sourceIndex returns a key->(Name,URL) mapping including synthetic Splash.
@@ -608,6 +645,7 @@ func (s *WhepServer) ensureSharedPipeline(codec string) error {
                         }
                         if e != nil { log.Printf("Pipeline(shared) restart failed: %v", e); continue }
                         stopper = p
+                        s.mu.Lock(); s.shareStop = stopper.Stop; s.mu.Unlock()
                         currentW, currentH = w0, h0
                     }
                 }
@@ -680,6 +718,7 @@ func (s *WhepServer) restartSharedPipeline() error {
                         }
                         if e != nil { log.Printf("Pipeline(shared) restart failed: %v", e); continue }
                         stopper = p
+                        s.mu.Lock(); s.shareStop = stopper.Stop; s.mu.Unlock()
                         currentW, currentH = w0, h0
                     }
                 }

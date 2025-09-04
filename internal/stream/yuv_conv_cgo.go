@@ -95,6 +95,23 @@ func UYVYtoI420(src []byte, w, h int, yPlane, uPlane, vPlane []byte) {
         C.int(w), C.int(h),
     )
 }
+
+// I420Scale scales an I420 frame from (sw,sh) to (dw,dh) using libyuv.
+// If libyuv is not available, a pure-Go fallback will be used (see i420_scale_go.go).
+func I420Scale(ySrc, uSrc, vSrc []byte, sw, sh int, yDst, uDst, vDst []byte, dw, dh int) {
+    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 { return }
+    C.I420Scale(
+        (*C.uint8_t)(&ySrc[0]), C.int(sw),
+        (*C.uint8_t)(&uSrc[0]), C.int(sw/2),
+        (*C.uint8_t)(&vSrc[0]), C.int(sw/2),
+        C.int(sw), C.int(sh),
+        (*C.uint8_t)(&yDst[0]), C.int(dw),
+        (*C.uint8_t)(&uDst[0]), C.int(dw/2),
+        (*C.uint8_t)(&vDst[0]), C.int(dw/2),
+        C.int(dw), C.int(dh),
+        C.kFilterBox,
+    )
+}
 // ColorConversionImpl reports the active color conversion backend.
 func ColorConversionImpl() string { return "libyuv(" + bgraOrder + ")" }
 
