@@ -42,6 +42,12 @@ type WhepServer struct {
     // NDI selection shared across sessions
     ndiName  string
     ndiURL   string
+    // Shared encoder pipeline so we encode once and fanout to all sessions
+    shareBC     *stream.SampleBroadcaster
+    shareStop   func()
+    shareSrc    stream.Source
+    shareCodec  string
+    shareCancel context.CancelFunc // cancels resolution monitor
 }
 
 type session struct {
@@ -55,6 +61,7 @@ type session struct {
     codec    string
     created  time.Time
     state    string
+    detach   func() // unsubscribe from broadcaster
 }
 
 func NewWhepServer(cfg Config) *WhepServer {
@@ -168,143 +175,21 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
-
-    // Choose source: prefer NDI if env provided, else synthetic.
-    fps := s.cfg.FPS
-    if fps <= 0 { fps = 30 }
-    var src stream.Source
-    s.mu.Lock(); ndiURL := s.ndiURL; ndiName := s.ndiName; s.mu.Unlock()
-    if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
-    if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
-    if ndiURL != "" || ndiName != "" {
-        if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") {
-            // Special fake NDI source that maps to synthetic generator
-            log.Printf("Using fake NDI source 'Splash' -> synthetic")
-            src = nil // nil signals pipelines to use synthetic
-        } else if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
-            log.Printf("Using NDI source (url=%v, name=%v)", ndiURL != "", ndiName)
-            src = nd
-        } else {
-            log.Printf("NDI source unavailable (%v), falling back to synthetic", err)
-        }
-    }
-    // Start AV1/VP9/VP8 pipeline (no H.264 fallback here)
-    var stopper interface{ Stop() }
-    switch codec {
-    case "av1":
-        pipeAV1, err := stream.StartAV1Pipeline(stream.PipelineConfig{
-            Width:  s.cfg.Width,
-            Height: s.cfg.Height,
-            FPS:    fps,
-            BitrateKbps: s.cfg.BitrateKbps,
-            Source: src,
-            Track:  videoTrack,
-        })
-        if err != nil {
-            _ = pc.Close()
-            http.Error(w, fmt.Sprintf("AV1 pipeline error: %v", err), http.StatusInternalServerError)
-            return
-        }
-        stopper = pipeAV1
-    case "vp9":
-        pipeVP9, err := stream.StartVP9Pipeline(stream.PipelineConfig{
-            Width:  s.cfg.Width,
-            Height: s.cfg.Height,
-            FPS:    fps,
-            BitrateKbps: s.cfg.BitrateKbps,
-            Source: src,
-            Track:  videoTrack,
-        })
-        if err != nil {
-            _ = pc.Close()
-            http.Error(w, fmt.Sprintf("VP9 pipeline error: %v", err), http.StatusInternalServerError)
-            return
-        }
-        stopper = pipeVP9
-    default: // vp8
-        df := s.cfg.VP8Dropframe
-        if src == nil { df = 0 } // ensure synthetic "Splash" animates reliably
-        pipeVP8, err := stream.StartVP8Pipeline(stream.PipelineConfig{
-            Width:  s.cfg.Width,
-            Height: s.cfg.Height,
-            FPS:    fps,
-            BitrateKbps: s.cfg.BitrateKbps,
-            Source: src,
-            Track:  videoTrack,
-            VP8Speed: s.cfg.VP8Speed,
-            VP8Dropframe: df,
-        })
-        if err != nil {
-            _ = pc.Close()
-            http.Error(w, fmt.Sprintf("VP8 pipeline error: %v", err), http.StatusInternalServerError)
-            return
-        }
-        stopper = pipeVP8
-    }
-
-    // Create a cancellable context for the resolution monitoring goroutine
-    ctx, cancelFunc := context.WithCancel(context.Background())
     
-    // Monitor for source resolution changes and restart pipeline when needed
-    type sourceWithLast interface{ Last() ([]byte,int,int,bool) }
-    if src != nil {
-        if reporter, ok := src.(sourceWithLast); ok {
-            pipeMu := &sync.Mutex{}
-            currentW, currentH := s.cfg.Width, s.cfg.Height
-            go func() {
-                ticker := time.NewTicker(1 * time.Second)
-                defer ticker.Stop()
-                for {
-                    select {
-                    case <-ctx.Done():
-                        return
-                    case <-ticker.C:
-                        _, w0, h0, ok := reporter.Last()
-                        if !ok || w0 <= 0 || h0 <= 0 { continue }
-                        // Avoid restart if unchanged
-                        if w0 == currentW && h0 == currentH { continue }
-                        log.Printf("Pipeline: source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
-                        // Restart pipeline with new size
-                        pipeMu.Lock()
-                        if stopper != nil { stopper.Stop() }
-                        var newStop interface{ Stop() }
-                        var p interface{ Stop() }
-                        var err error
-                        switch codec {
-                        case "vp9":
-                            p, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
-                        case "av1":
-                            p, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack})
-                        default:
-                            p, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:videoTrack, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
-                        }
-                        newStop = p
-                        if err != nil {
-                            log.Printf("Pipeline: restart failed: %v", err)
-                            pipeMu.Unlock()
-                            continue
-                        }
-                        stopper = newStop
-                        // Update session stop func if session is registered
-                        s.mu.Lock()
-                        if ss, ok := s.sessions[id]; ok && newStop != nil {
-                            ss.stop = newStop.Stop
-                        }
-                        s.mu.Unlock()
-                        currentW, currentH = w0, h0
-                        pipeMu.Unlock()
-                    }
-                }
-            }()
-        }
-    } else {
-        // If no NDI source, create a no-op cancelFunc
-        cancelFunc = func() {}
+    // Ensure a shared encoder pipeline exists for this codec and current source
+    if err := s.ensureSharedPipeline(codec); err != nil {
+        _ = pc.Close()
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
     }
+    // Attach this session's track to the broadcaster so it receives samples
+    s.mu.Lock()
+    var detach func()
+    if s.shareBC != nil { detach = s.shareBC.Add(videoTrack) } else { detach = func(){} }
+    s.mu.Unlock()
 
     // WHEP semantics: set remote offer, answer, and wait for ICE gather complete
     if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: string(offerSDP)}); err != nil {
-        if stopper != nil { stopper.Stop() }
         _ = pc.Close()
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
@@ -312,19 +197,20 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 
     answer, err := pc.CreateAnswer(nil)
     if err != nil {
-        if stopper != nil { stopper.Stop() }; _ = pc.Close()
+        _ = pc.Close()
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
     gatherComplete := webrtc.GatheringCompletePromise(pc)
     if err := pc.SetLocalDescription(answer); err != nil {
-        if stopper != nil { stopper.Stop() }; _ = pc.Close()
+        _ = pc.Close()
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
     <-gatherComplete
 
-    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: stopper.Stop, src: src, cancelFunc: cancelFunc, codec: codec, created: time.Now() }
+    // Register session (no per-session encoder; we rely on shared pipeline)
+    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: s.shareSrc, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach }
     s.mu.Lock(); s.sessions[id] = sess; s.mu.Unlock()
 
     pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -342,25 +228,19 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     go func() {
         timer := time.NewTimer(30 * time.Second)
         defer timer.Stop()
-        
-        select {
-        case <-timer.C:
-            // Check if session is still in connecting state and clean it up
-            s.mu.Lock()
-            if sess, exists := s.sessions[id]; exists {
-                currentState := sess.pc.ConnectionState()
-                if currentState == webrtc.PeerConnectionStateNew || currentState == webrtc.PeerConnectionStateConnecting {
-                    log.Printf("Session %s: timeout after 30s, cleaning up (state: %s)", id, currentState)
-                    s.mu.Unlock()
-                    s.closeSession(id)
-                    return
-                }
+        <-timer.C
+        // Check if session is still in connecting state and clean it up
+        s.mu.Lock()
+        if sess, exists := s.sessions[id]; exists {
+            currentState := sess.pc.ConnectionState()
+            if currentState == webrtc.PeerConnectionStateNew || currentState == webrtc.PeerConnectionStateConnecting {
+                log.Printf("Session %s: timeout after 30s, cleaning up (state: %s)", id, currentState)
+                s.mu.Unlock()
+                s.closeSession(id)
+                return
             }
-            s.mu.Unlock()
-        case <-ctx.Done():
-            // Session was closed before timeout
-            return
         }
+        s.mu.Unlock()
     }()
 
     allowCORS(w, r)
@@ -368,6 +248,165 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Location", fmt.Sprintf("/whep/%s", id))
     w.WriteHeader(http.StatusCreated)
     _, _ = io.WriteString(w, pc.LocalDescription().SDP)
+}
+
+// ensureSharedPipeline ensures there is a single encoder running that writes to a
+// broadcaster, so multiple sessions can reuse the same encoded frames.
+func (s *WhepServer) ensureSharedPipeline(codec string) error {
+    s.mu.Lock()
+    // Tear down if codec mismatch
+    if s.shareBC != nil && s.shareCodec != "" && s.shareCodec != codec {
+        if s.shareCancel != nil { s.shareCancel() }
+        if s.shareStop != nil { s.shareStop() }
+        if s.shareSrc != nil { s.shareSrc.Stop() }
+        s.shareBC.Close()
+        s.shareBC, s.shareStop, s.shareSrc, s.shareCodec, s.shareCancel = nil, nil, nil, "", nil
+    }
+    if s.shareBC != nil {
+        s.mu.Unlock()
+        return nil
+    }
+    bc := stream.NewSampleBroadcaster()
+    // Snapshot selection
+    ndiURL, ndiName := s.ndiURL, s.ndiName
+    s.mu.Unlock()
+    if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
+    if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
+    var src stream.Source
+    if ndiURL != "" || ndiName != "" {
+        if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") {
+            log.Printf("Using fake NDI source 'Splash' -> synthetic")
+            src = nil
+        } else if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil {
+            log.Printf("Using NDI source (url=%v, name=%v)", ndiURL != "", ndiName)
+            src = nd
+        } else {
+            log.Printf("NDI source unavailable (%v), falling back to synthetic", err)
+        }
+    }
+    fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
+    // Start pipeline -> broadcaster
+    var stopper interface{ Stop() }
+    var err error
+    switch codec {
+    case "av1":
+        stopper, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+    case "vp9":
+        stopper, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+    default:
+        df := s.cfg.VP8Dropframe; if src == nil { df = 0 }
+        stopper, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df})
+    }
+    if err != nil { return fmt.Errorf("shared pipeline start: %w", err) }
+    // Monitor for source resolution changes
+    ctx, cancel := context.WithCancel(context.Background())
+    if src != nil {
+        if reporter, ok := src.(interface{ Last()([]byte,int,int,bool) }); ok {
+            currentW, currentH := s.cfg.Width, s.cfg.Height
+            go func() {
+                ticker := time.NewTicker(1 * time.Second)
+                defer ticker.Stop()
+                for {
+                    select {
+                    case <-ctx.Done():
+                        return
+                    case <-ticker.C:
+                        _, w0, h0, ok := reporter.Last(); if !ok || w0<=0 || h0<=0 { continue }
+                        if w0 == currentW && h0 == currentH { continue }
+                        log.Printf("Pipeline(shared): source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
+                        if stopper != nil { stopper.Stop() }
+                        var p interface{ Stop() }
+                        var e error
+                        switch codec {
+                        case "vp9":
+                            p, e = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+                        case "av1":
+                            p, e = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+                        default:
+                            p, e = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
+                        }
+                        if e != nil { log.Printf("Pipeline(shared) restart failed: %v", e); continue }
+                        stopper = p
+                        currentW, currentH = w0, h0
+                    }
+                }
+            }()
+        }
+    }
+    s.mu.Lock()
+    s.shareBC, s.shareStop, s.shareSrc, s.shareCodec, s.shareCancel = bc, stopper.Stop, src, codec, cancel
+    s.mu.Unlock()
+    return nil
+}
+
+// restartSharedPipeline applies the current NDI selection to the running shared pipeline.
+// If no pipeline exists, it is a no-op.
+func (s *WhepServer) restartSharedPipeline() error {
+    s.mu.Lock()
+    if s.shareBC == nil { s.mu.Unlock(); return nil }
+    codec := s.shareCodec
+    // Tear down existing
+    if s.shareCancel != nil { s.shareCancel() }
+    if s.shareStop != nil { s.shareStop() }
+    if s.shareSrc != nil { s.shareSrc.Stop() }
+    s.shareStop, s.shareSrc, s.shareCancel = nil, nil, nil
+    bc := s.shareBC
+    ndiURL, ndiName := s.ndiURL, s.ndiName
+    s.mu.Unlock()
+    if ndiURL == "" { ndiURL = os.Getenv("NDI_SOURCE_URL") }
+    if ndiName == "" { ndiName = os.Getenv("NDI_SOURCE") }
+    var src stream.Source
+    if ndiURL != "" || ndiName != "" {
+        if strings.EqualFold(ndiName, "splash") || strings.EqualFold(ndiURL, "ndi://splash") { src = nil } else if nd, err := stream.NewNDISource(ndiURL, ndiName); err == nil { src = nd }
+    }
+    fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
+    var stopper interface{ Stop() }
+    var err error
+    switch codec {
+    case "av1":
+        stopper, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+    case "vp9":
+        stopper, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+    default:
+        df := s.cfg.VP8Dropframe; if src == nil { df = 0 }
+        stopper, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df})
+    }
+    if err != nil { return err }
+    ctx, cancel := context.WithCancel(context.Background())
+    if src != nil {
+        if reporter, ok := src.(interface{ Last()([]byte,int,int,bool) }); ok {
+            currentW, currentH := s.cfg.Width, s.cfg.Height
+            go func() {
+                ticker := time.NewTicker(1 * time.Second)
+                defer ticker.Stop()
+                for {
+                    select {
+                    case <-ctx.Done(): return
+                    case <-ticker.C:
+                        _, w0, h0, ok := reporter.Last(); if !ok || w0<=0 || h0<=0 { continue }
+                        if w0 == currentW && h0 == currentH { continue }
+                        log.Printf("Pipeline(shared): source resolution change detected %dx%d -> %dx%d, restarting encoder", currentW, currentH, w0, h0)
+                        if stopper != nil { stopper.Stop() }
+                        var p interface{ Stop() }
+                        var e error
+                        switch codec {
+                        case "vp9":
+                            p, e = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+                        case "av1":
+                            p, e = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc})
+                        default:
+                            p, e = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
+                        }
+                        if e != nil { log.Printf("Pipeline(shared) restart failed: %v", e); continue }
+                        stopper = p
+                        currentW, currentH = w0, h0
+                    }
+                }
+            }()
+        }
+    }
+    s.mu.Lock(); s.shareStop, s.shareSrc, s.shareCancel = stopper.Stop, src, cancel; s.mu.Unlock()
+    return nil
 }
 
 // GET /ndi/sources -> { sources: [ { name, url } ] }
@@ -407,11 +446,9 @@ func (s *WhepServer) handleNDISelect(w http.ResponseWriter, r *http.Request) {
     if selName == "" && len(srcs) > 0 { // fallback to first
         selName, selURL = srcs[0].Name, srcs[0].URL
     }
-    s.mu.Lock(); s.ndiName, s.ndiURL = selName, selURL; sessions := make([]*session, 0, len(s.sessions)); for _, ss := range s.sessions { sessions = append(sessions, ss) } ; s.mu.Unlock()
-    // Restart pipelines for all active sessions to apply new source immediately
-    for _, ss := range sessions {
-        _ = s.restartSessionPipeline(ss)
-    }
+    s.mu.Lock(); s.ndiName, s.ndiURL = selName, selURL; s.mu.Unlock()
+    // Restart shared pipeline so all sessions switch source
+    _ = s.restartSharedPipeline()
     _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "selected": selName, "url": selURL})
 }
 
@@ -424,11 +461,9 @@ func (s *WhepServer) handleNDISelectURL(w http.ResponseWriter, r *http.Request) 
     if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.URL == "" {
         http.Error(w, "invalid JSON or missing 'url'", http.StatusBadRequest); return
     }
-    s.mu.Lock(); s.ndiURL = body.URL; sessions := make([]*session, 0, len(s.sessions)); for _, ss := range s.sessions { sessions = append(sessions, ss) } ; s.mu.Unlock()
-    // Restart pipelines for all active sessions to apply new source immediately
-    for _, ss := range sessions {
-        _ = s.restartSessionPipeline(ss)
-    }
+    s.mu.Lock(); s.ndiURL = body.URL; s.mu.Unlock()
+    // Restart shared pipeline so all sessions switch source
+    _ = s.restartSharedPipeline()
     _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "url": body.URL})
 }
 
@@ -517,11 +552,23 @@ func (s *WhepServer) closeSession(id string) {
         if sess.cancelFunc != nil {
             sess.cancelFunc()
         }
+        if sess.detach != nil { sess.detach() }
         if sess.stop != nil { sess.stop() }
         if sess.src != nil { sess.src.Stop() }
         _ = sess.pc.Close()
         log.Printf("WHEP session %s: closed", id)
     }
+    // If no more sessions, stop shared pipeline to save CPU
+    s.mu.Lock()
+    if len(s.sessions) == 0 && s.shareBC != nil {
+        if s.shareCancel != nil { s.shareCancel() }
+        if s.shareStop != nil { s.shareStop() }
+        if s.shareSrc != nil { s.shareSrc.Stop() }
+        s.shareBC.Close()
+        s.shareBC, s.shareStop, s.shareSrc, s.shareCodec, s.shareCancel = nil, nil, nil, "", nil
+        log.Printf("Shared pipeline stopped (no active sessions)")
+    }
+    s.mu.Unlock()
 }
 
 // handleFramePNG returns a single PNG frame from the currently selected NDI source.

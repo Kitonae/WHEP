@@ -132,7 +132,7 @@ for %%i in ("%NDI_LIB64%") do set "NDI_LIB64_SAFE=%%~si"
 for %%i in ("%LIBVPX_PATH%") do set "LIBVPX_PATH_SAFE=%%~si"
 
 rem Determine libvpx include dir: force using source headers to match built lib version
-set "LIBVPX_INCLUDE=%LIBVPX_PATH%\src"
+set "LIBVPX_INCLUDE=%LIBVPX_PATH%\include"
 for %%i in ("%LIBVPX_INCLUDE%") do set "LIBVPX_INCLUDE_SAFE=%%~si"
 if "%LIBVPX_INCLUDE_SAFE%"=="" set "LIBVPX_INCLUDE_SAFE=%LIBVPX_INCLUDE%"
 for %%i in ("%LIBYUV_PATH%") do set "LIBYUV_PATH_SAFE=%%~si"
@@ -156,7 +156,7 @@ if exist "%LIBVPX_PATH_SAFE%\lib\libvpx.a" (
 ) else (
   set "VPX_LINK=-lvpx"
 )
-set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%LIBYUV_LIB_SAFE% -L%NDI_LIB64_SAFE% -lProcessing.NDI.Lib.x64 -L%LIBVPX_PATH_SAFE%\lib %VPX_LINK% -L%LIBYUV_LIB_SAFE% -lyuv -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
+set "CGO_LDFLAGS=-L%LIBVPX_PATH_SAFE%\lib -L%LIBYUV_LIB_SAFE% -L%NDI_LIB64_SAFE% -l:Processing.NDI.Lib.x64.lib -L%LIBVPX_PATH_SAFE%\lib %VPX_LINK% -L%LIBYUV_LIB_SAFE% -lyuv -lmingwex -lmingw32 -lwinmm -lmsvcrt -luser32 -luuid"
 
 rem Allow all CGO flags (MinGW is more permissive than MSVC)
 set "CGO_CFLAGS_ALLOW=.*"
