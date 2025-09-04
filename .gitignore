@@ -195,6 +195,7 @@ vendor/
 # VP8/VPX related
 *.ivf
 *.webm
+libvpx-build/
 
 # Test artifacts
 testdata/
