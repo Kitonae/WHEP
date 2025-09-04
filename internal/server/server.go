@@ -22,6 +22,9 @@ import (
     "strings"
 )
 
+// Idle teardown for per-source mounts
+const mountIdleTTL = 60 * time.Second
+
 type Config struct {
     Host   string
     Port   int
@@ -48,6 +51,9 @@ type WhepServer struct {
     shareSrc    stream.Source
     shareCodec  string
     shareCancel context.CancelFunc // cancels resolution monitor
+
+    // Per-source mounts: one shared pipeline per NDI source key
+    mounts map[string]*ndiMount
 }
 
 type session struct {
@@ -62,12 +68,52 @@ type session struct {
     created  time.Time
     state    string
     detach   func() // unsubscribe from broadcaster
+    mountKey string // for per-source mount sessions
+}
+
+// ndiMount represents a per-source shared pipeline that fans out to many sessions.
+type ndiMount struct {
+    key       string
+    name      string
+    url       string
+    codec     string
+    bc        *stream.SampleBroadcaster
+    stop      func()
+    src       stream.Source
+    cancel    context.CancelFunc
+    mu        sync.Mutex
+    sessions  map[string]struct{}
+    idleTimer *time.Timer
+}
+
+func (m *ndiMount) refCount() int {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    return len(m.sessions)
+}
+
+func (m *ndiMount) addSession(id string) {
+    m.mu.Lock()
+    if m.sessions == nil { m.sessions = make(map[string]struct{}) }
+    m.sessions[id] = struct{}{}
+    if m.idleTimer != nil { m.idleTimer.Stop(); m.idleTimer = nil }
+    m.mu.Unlock()
+}
+
+func (m *ndiMount) removeSession(id string, onIdle func()) {
+    m.mu.Lock()
+    delete(m.sessions, id)
+    left := len(m.sessions)
+    if left == 0 && m.idleTimer == nil {
+        m.idleTimer = time.AfterFunc(mountIdleTTL, onIdle)
+    }
+    m.mu.Unlock()
 }
 
 func NewWhepServer(cfg Config) *WhepServer {
     // Start background NDI discovery so API can serve cached results immediately
     ndi.StartBackgroundDiscovery()
-    s := &WhepServer{cfg: cfg, sessions: map[string]*session{}}
+    s := &WhepServer{cfg: cfg, sessions: map[string]*session{}, mounts: map[string]*ndiMount{}}
     // Preflight logs
     log.Printf("Color conversion: %s", stream.ColorConversionImpl())
     // Reset metrics at startup
@@ -78,6 +124,8 @@ func NewWhepServer(cfg Config) *WhepServer {
 func (s *WhepServer) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/whep", s.handleWHEPPost)
     mux.HandleFunc("/whep/", s.handleWHEPResource)
+    // Per-source WHEP mounts
+    mux.HandleFunc("/whep/ndi/", s.handleWHEPNDI)
     mux.HandleFunc("/ndi/sources", s.handleNDISources)
     mux.HandleFunc("/ndi/select", s.handleNDISelect)
     mux.HandleFunc("/ndi/select_url", s.handleNDISelectURL)
@@ -250,6 +298,239 @@ func (s *WhepServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
     _, _ = io.WriteString(w, pc.LocalDescription().SDP)
 }
 
+// handleWHEPNDI routes both mount creation (POST /whep/ndi/{key}) and session resource
+// operations (PATCH/DELETE /whep/ndi/{key}/sessions/{id}).
+func (s *WhepServer) handleWHEPNDI(w http.ResponseWriter, r *http.Request) {
+    allowCORS(w, r)
+    // Trim prefix
+    path := strings.TrimPrefix(r.URL.Path, "/whep/ndi/")
+    // Session resource path?
+    parts := strings.Split(path, "/")
+    if len(parts) >= 3 && parts[1] == "sessions" {
+        key := parts[0]
+        id := parts[2]
+        switch r.Method {
+        case http.MethodPatch:
+            // Trickle-ICE noop for now
+            w.WriteHeader(http.StatusNoContent)
+            return
+        case http.MethodDelete:
+            s.closeSession(id)
+            // Also update mount refcount idle handling
+            s.mu.Lock()
+            if m := s.mounts[key]; m != nil {
+                m.removeSession(id, func() { s.teardownMountIfIdle(key) })
+            }
+            s.mu.Unlock()
+            w.WriteHeader(http.StatusNoContent)
+            return
+        case http.MethodOptions:
+            w.WriteHeader(http.StatusNoContent)
+            return
+        default:
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+    }
+
+    // Mount create (POST /whep/ndi/{key})
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    key := strings.TrimSuffix(path, "/")
+    if key == "" { http.Error(w, "missing source key", http.StatusBadRequest); return }
+
+    offerSDP, err := io.ReadAll(r.Body)
+    if err != nil || len(offerSDP) == 0 {
+        http.Error(w, "empty offer", http.StatusBadRequest)
+        return
+    }
+
+    // Ensure a mount exists for this key
+    m, err := s.ensureMount(key)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+
+    // Build PC and attach track to mount broadcaster
+    me := webrtc.MediaEngine{}
+    if err := me.RegisterDefaultCodecs(); err != nil { http.Error(w, err.Error(), http.StatusInternalServerError); return }
+    api := webrtc.NewAPI(webrtc.WithMediaEngine(&me))
+    pc, err := api.NewPeerConnection(webrtc.Configuration{})
+    if err != nil { http.Error(w, err.Error(), http.StatusInternalServerError); return }
+
+    id := uuid.New().String()
+    codec := strings.ToLower(s.cfg.Codec)
+    mime := webrtc.MimeTypeVP8
+    switch codec { case "vp9": mime = webrtc.MimeTypeVP9; case "av1": mime = webrtc.MimeTypeAV1; default: codec = "vp8" }
+    videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: mime}, "video", "pion")
+    if err != nil { _ = pc.Close(); http.Error(w, err.Error(), http.StatusInternalServerError); return }
+    sender, err := pc.AddTrack(videoTrack)
+    if err != nil { _ = pc.Close(); http.Error(w, err.Error(), http.StatusInternalServerError); return }
+
+    // Attach to broadcaster
+    var detach func()
+    m.mu.Lock(); if m.bc != nil { detach = m.bc.Add(videoTrack) } else { detach = func(){} }; m.mu.Unlock()
+
+    if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: string(offerSDP)}); err != nil {
+        _ = pc.Close(); http.Error(w, err.Error(), http.StatusBadRequest); return }
+    answer, err := pc.CreateAnswer(nil)
+    if err != nil { _ = pc.Close(); http.Error(w, err.Error(), http.StatusInternalServerError); return }
+    gatherComplete := webrtc.GatheringCompletePromise(pc)
+    if err := pc.SetLocalDescription(answer); err != nil { _ = pc.Close(); http.Error(w, err.Error(), http.StatusInternalServerError); return }
+    <-gatherComplete
+
+    sess := &session{ id: id, pc: pc, sender: sender, track: videoTrack, stop: func(){}, src: m.src, cancelFunc: nil, codec: codec, created: time.Now(), detach: detach, mountKey: key }
+    s.mu.Lock(); s.sessions[id] = sess; if mm := s.mounts[key]; mm != nil { mm.addSession(id) }
+    s.mu.Unlock()
+
+    pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+        log.Printf("Session %s state: %s", id, state)
+        s.mu.Lock(); if ss, ok := s.sessions[id]; ok { ss.state = state.String() }; s.mu.Unlock()
+        if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateDisconnected {
+            s.closeSession(id)
+            s.mu.Lock(); if mm := s.mounts[key]; mm != nil { mm.removeSession(id, func(){ s.teardownMountIfIdle(key) }) }; s.mu.Unlock()
+        }
+    })
+
+    w.Header().Set("Content-Type", "application/sdp")
+    w.Header().Set("Location", fmt.Sprintf("/whep/ndi/%s/sessions/%s", key, id))
+    w.WriteHeader(http.StatusCreated)
+    _, _ = io.WriteString(w, pc.LocalDescription().SDP)
+}
+
+// ensureMount ensures a per-source shared pipeline exists for the given key.
+func (s *WhepServer) ensureMount(key string) (*ndiMount, error) {
+    s.mu.Lock()
+    if m, ok := s.mounts[key]; ok && m.bc != nil {
+        s.mu.Unlock()
+        return m, nil
+    }
+    // Resolve key to source info
+    idx := s.sourceIndex()
+    si, ok := idx[key]
+    if !ok {
+        s.mu.Unlock()
+        return nil, fmt.Errorf("source not found: %s", key)
+    }
+    // Create new mount and start pipeline
+    m := &ndiMount{ key: key, name: si.Name, url: si.URL, codec: strings.ToLower(s.cfg.Codec), bc: stream.NewSampleBroadcaster(), sessions: map[string]struct{}{} }
+    s.mounts[key] = m
+    s.mu.Unlock()
+
+    // Build NDI Source (nil for Splash synthetic)
+    var src stream.Source
+    if strings.EqualFold(si.Name, "splash") || strings.EqualFold(si.URL, "ndi://Splash") {
+        src = nil
+    } else if nd, err := stream.NewNDISource(si.URL, si.Name); err == nil {
+        src = nd
+    } else {
+        // fall back to synthetic if unavailable
+        src = nil
+    }
+
+    fps := s.cfg.FPS; if fps <= 0 { fps = 30 }
+    var stopper interface{ Stop() }
+    var err error
+    switch m.codec {
+    case "av1":
+        stopper, err = stream.StartAV1Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+    case "vp9":
+        stopper, err = stream.StartVP9Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+    default:
+        df := s.cfg.VP8Dropframe; if src == nil { df = 0 }
+        stopper, err = stream.StartVP8Pipeline(stream.PipelineConfig{Width:s.cfg.Width, Height:s.cfg.Height, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:df})
+    }
+    if err != nil { return nil, fmt.Errorf("mount start: %w", err) }
+
+    // Monitor source resolution for restarts
+    ctx, cancel := context.WithCancel(context.Background())
+    if src != nil {
+        if reporter, ok := src.(interface{ Last()([]byte,int,int,bool) }); ok {
+            currentW, currentH := s.cfg.Width, s.cfg.Height
+            go func() {
+                ticker := time.NewTicker(1 * time.Second)
+                defer ticker.Stop()
+                for {
+                    select {
+                    case <-ctx.Done(): return
+                    case <-ticker.C:
+                        _, w0, h0, ok := reporter.Last(); if !ok || w0<=0 || h0<=0 { continue }
+                        if w0 == currentW && h0 == currentH { continue }
+                        log.Printf("Pipeline(mount %s): source resolution change %dx%d -> %dx%d, restarting", key, currentW, currentH, w0, h0)
+                        if stopper != nil { stopper.Stop() }
+                        var p interface{ Stop() }
+                        var e error
+                        switch m.codec {
+                        case "vp9":
+                            p, e = stream.StartVP9Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+                        case "av1":
+                            p, e = stream.StartAV1Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc})
+                        default:
+                            p, e = stream.StartVP8Pipeline(stream.PipelineConfig{Width:w0, Height:h0, FPS:fps, BitrateKbps:s.cfg.BitrateKbps, Source:src, Track:m.bc, VP8Speed:s.cfg.VP8Speed, VP8Dropframe:s.cfg.VP8Dropframe})
+                        }
+                        if e != nil { log.Printf("Pipeline(mount %s) restart failed: %v", key, e); continue }
+                        stopper = p
+                        currentW, currentH = w0, h0
+                    }
+                }
+            }()
+        }
+    }
+    m.mu.Lock(); m.src = src; m.stop = stopper.Stop; m.cancel = cancel; m.mu.Unlock()
+    return m, nil
+}
+
+// teardownMountIfIdle tears down a mount when it has become idle.
+func (s *WhepServer) teardownMountIfIdle(key string) {
+    s.mu.Lock(); m := s.mounts[key]; s.mu.Unlock()
+    if m == nil { return }
+    if m.refCount() > 0 { return }
+    m.mu.Lock()
+    if m.cancel != nil { m.cancel() }
+    if m.stop != nil { m.stop() }
+    if m.src != nil { m.src.Stop() }
+    if m.bc != nil { m.bc.Close() }
+    m.bc, m.stop, m.src, m.cancel = nil, nil, nil, nil
+    m.mu.Unlock()
+    log.Printf("Mount %s torn down (idle)", key)
+}
+
+// sourceIndex returns a key->(Name,URL) mapping including synthetic Splash.
+func (s *WhepServer) sourceIndex() map[string]struct{ Name, URL string } {
+    out := map[string]struct{ Name, URL string }{}
+    // Splash synthetic
+    out[slugKey("Splash", "ndi://Splash")] = struct{ Name, URL string }{"Splash", "ndi://Splash"}
+    for _, si := range ndi.GetCachedSources() {
+        key := slugKey(si.Name, si.URL)
+        out[key] = struct{ Name, URL string }{Name: si.Name, URL: si.URL}
+    }
+    return out
+}
+
+func slugKey(name, url string) string {
+    base := url
+    if base == "" { base = name }
+    if base == "" { base = uuid.New().String() }
+    // Lowercase and keep safe characters
+    b := strings.ToLower(base)
+    // Replace unsafe with '-'
+    var sb strings.Builder
+    for _, r := range b {
+        if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') { sb.WriteRune(r) } else { sb.WriteByte('-') }
+    }
+    s := sb.String()
+    // Collapse consecutive '-'
+    s = strings.Trim(s, "-")
+    for strings.Contains(s, "--") { s = strings.ReplaceAll(s, "--", "-") }
+    if s == "" { s = "src" }
+    return s
+}
+
 // ensureSharedPipeline ensures there is a single encoder running that writes to a
 // broadcaster, so multiple sessions can reuse the same encoded frames.
 func (s *WhepServer) ensureSharedPipeline(codec string) error {
@@ -413,14 +694,21 @@ func (s *WhepServer) restartSharedPipeline() error {
 func (s *WhepServer) handleNDISources(w http.ResponseWriter, r *http.Request) {
     allowCORS(w, r)
     if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
-    type Info struct{ Name string `json:"name"`; URL string `json:"url"` }
-    // Serve from cache immediately for responsiveness
-    srcs := ndi.GetCachedSources()
-    list := make([]Info, 0, len(srcs)+1)
-    // Inject fake source "Splash" which maps to the synthetic generator
-    list = append(list, Info{Name: "Splash", URL: "ndi://Splash"})
-    for _, si := range srcs { list = append(list, Info{Name: si.Name, URL: si.URL}) }
-    _ = json.NewEncoder(w).Encode(map[string]any{"sources": list})
+    type Info struct{
+        ID    string `json:"id"`
+        Name  string `json:"name"`
+        URL   string `json:"url"`
+        WHEP  string `json:"whepEndpoint"`
+    }
+    idx := s.sourceIndex()
+    list := make([]Info, 0, len(idx))
+    for k, si := range idx {
+        list = append(list, Info{ID: k, Name: si.Name, URL: si.URL, WHEP: "/whep/ndi/" + k})
+    }
+    // Keep backward-compatible shape: { sources: [ { name, url } ], mounts: [Info] }
+    compat := make([]map[string]string, 0, len(list))
+    for _, it := range list { compat = append(compat, map[string]string{"name": it.Name, "url": it.URL}) }
+    _ = json.NewEncoder(w).Encode(map[string]any{"sources": compat, "mounts": list})
 }
 
 // POST /ndi/select { "source": "substring or exact name" }
@@ -557,6 +845,10 @@ func (s *WhepServer) closeSession(id string) {
         if sess.src != nil { sess.src.Stop() }
         _ = sess.pc.Close()
         log.Printf("WHEP session %s: closed", id)
+        // Update mount refcounts if applicable
+        if sess.mountKey != "" {
+            s.mu.Lock(); if m := s.mounts[sess.mountKey]; m != nil { m.removeSession(id, func(){ s.teardownMountIfIdle(sess.mountKey) }) }; s.mu.Unlock()
+        }
     }
     // If no more sessions, stop shared pipeline to save CPU
     s.mu.Lock()
