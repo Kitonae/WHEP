@@ -65,6 +65,7 @@ Most flags also read from environment variables. See `/config` at runtime for a 
 - `-width` / `VIDEO_WIDTH`, `-height` / `VIDEO_HEIGHT`: initial/synthetic size (default `1280x720`)
 - `-vp8speed` / `VIDEO_VP8_SPEED`: VP8 `cpu_used` speed (0..8, default 8)
 - `-vp8dropframe` / `VIDEO_VP8_DROPFRAME`: VP8 drop-frame threshold (default 25)
+- `-scaleFilter` / `YUV_SCALE_FILTER`: scaler filter for libyuv down/up-scaling: `NONE`, `LINEAR`, `BILINEAR`, `BOX` (default `BOX`)
 - `-color` / `NDI_RECV_COLOR`: NDI receive color `bgra` or `uyvy` (Windows + NDI)
 - NDI discovery: `NDI_SOURCE`, `NDI_SOURCE_URL`, `NDI_GROUPS`, `NDI_EXTRA_IPS`
 
@@ -112,6 +113,7 @@ You can also provide `?endpoint=...&ice=...` as URL parameters.
 
 - `/health` returns JSON with session counts, dropped frames, and runtime stats
 - Startup logs include the active color conversion backend: `libyuv` or `pure-go`
+- Each Windows MinGW build auto-increments a build number and embeds it into the binary. Print it with `whep.exe -version`.
 
 
 ## Development tips

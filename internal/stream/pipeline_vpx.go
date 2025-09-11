@@ -80,7 +80,6 @@ func (p *PipelineVP8) loop() {
     enqueue, stopWriter := newAsyncSampleWriter(p.cfg.Track)
     defer stopWriter()
     var srcW, srcH int
-    var ySrc, uSrc, vSrc []byte
     for {
         select { case <-p.quit: return; case <-ticker.C: }
         frame, ok := p.cfg.Source.Next()
@@ -89,33 +88,20 @@ func (p *PipelineVP8) loop() {
         // Determine source dimensions if available
         if s, ok := p.cfg.Source.(sourceWithLast); ok {
             if _, w0, h0, ok2 := s.Last(); ok2 && w0 > 0 && h0 > 0 {
-                if w0 != srcW || h0 != srcH {
-                    srcW, srcH = w0, h0
-                    ySrc = make([]byte, srcW*srcH)
-                    uSrc = make([]byte, (srcW/2)*(srcH/2))
-                    vSrc = make([]byte, (srcW/2)*(srcH/2))
-                }
+                srcW, srcH = w0, h0
             }
         }
-        if srcW <= 0 || srcH <= 0 { srcW, srcH = dstW, dstH; ySrc, uSrc, vSrc = y, u, v }
+        if srcW <= 0 || srcH <= 0 { srcW, srcH = dstW, dstH }
+        // Enforce pre-scaled source frames. If mismatch, drop until source adjusts.
+        if srcW != dstW || srcH != dstH { continue }
         switch pixfmt {
         case "uyvy422":
             // Expect packed 4:2:2 (2 bytes per pixel) from source
             if len(frame) < srcW*srcH*2 { continue }
-            if srcW == dstW && srcH == dstH {
-                UYVYtoI420(frame, srcW, srcH, y, u, v)
-            } else {
-                UYVYtoI420(frame, srcW, srcH, ySrc, uSrc, vSrc)
-                I420Scale(ySrc, uSrc, vSrc, srcW, srcH, y, u, v, dstW, dstH)
-            }
+            UYVYtoI420(frame, srcW, srcH, y, u, v)
         default: // bgra
             if len(frame) < srcW*srcH*4 { continue }
-            if srcW == dstW && srcH == dstH {
-                BGRAtoI420(frame, srcW, srcH, y, u, v)
-            } else {
-                BGRAtoI420(frame, srcW, srcH, ySrc, uSrc, vSrc)
-                I420Scale(ySrc, uSrc, vSrc, srcW, srcH, y, u, v, dstW, dstH)
-            }
+            BGRAtoI420(frame, srcW, srcH, y, u, v)
         }
         packets, key, err := p.enc.EncodeI420(y, u, v)
         if err != nil { return }

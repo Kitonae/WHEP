@@ -18,6 +18,9 @@ type NDISource struct {
     firstLogged bool
     pixfmt string // "bgra" or "uyvy422"
     stopped int32 // atomic flag to make Stop idempotent
+    // Optional output scaling requested by server (applied inside source loop when libyuv available)
+    outW int
+    outH int
 }
 
 // NewNDISource selects a source by URL if provided, else by name substring, else first available.
@@ -78,9 +81,33 @@ func (s *NDISource) loop() {
             if vf.Stride == vf.W*bytesPerPixel {
                 frame := make([]byte, len(vf.Data))
                 copy(frame, vf.Data)
-                s.w, s.h = vf.W, vf.H
-                s.pixfmt = "uyvy422"
-                s.last.Store(frame)
+                srcW, srcH := vf.W, vf.H
+                // Apply optional scaling to BGRA output if target set
+                if s.outW > 0 && s.outH > 0 && (s.outW != srcW || s.outH != srcH) {
+                    // Convert -> scale -> convert back to BGRA for pipeline consumption
+                    srcY := make([]byte, srcW*srcH)
+                    srcU := make([]byte, (srcW/2)*(srcH/2))
+                    srcV := make([]byte, (srcW/2)*(srcH/2))
+                    UYVYtoI420(frame, srcW, srcH, srcY, srcU, srcV)
+                    // Ensure even dims
+                    dw, dh := s.outW, s.outH
+                    if dw%2 != 0 { dw-- }
+                    if dh%2 != 0 { dh-- }
+                    if dw < 2 { dw = 2 }; if dh < 2 { dh = 2 }
+                    dstY := make([]byte, dw*dh)
+                    dstU := make([]byte, (dw/2)*(dh/2))
+                    dstV := make([]byte, (dw/2)*(dh/2))
+                    I420Scale(srcY, srcU, srcV, srcW, srcH, dstY, dstU, dstV, dw, dh)
+                    out := make([]byte, dw*dh*4)
+                    I420ToBGRA(dstY, dstU, dstV, dw, dh, out)
+                    s.w, s.h = dw, dh
+                    s.pixfmt = "bgra"
+                    s.last.Store(out)
+                } else {
+                    s.w, s.h = srcW, srcH
+                    s.pixfmt = "uyvy422"
+                    s.last.Store(frame)
+                }
             } else {
                 w, h := vf.W, vf.H
                 dst := make([]byte, w*h*bytesPerPixel)
@@ -89,18 +116,61 @@ func (s *NDISource) loop() {
                     dstOff := y*w*bytesPerPixel
                     copy(dst[dstOff:dstOff+w*bytesPerPixel], vf.Data[srcOff:srcOff+vf.Stride])
                 }
-                s.w, s.h = w, h
-                s.pixfmt = "uyvy422"
-                s.last.Store(dst)
+                srcW, srcH := w, h
+                if s.outW > 0 && s.outH > 0 && (s.outW != srcW || s.outH != srcH) {
+                    srcY := make([]byte, srcW*srcH)
+                    srcU := make([]byte, (srcW/2)*(srcH/2))
+                    srcV := make([]byte, (srcW/2)*(srcH/2))
+                    UYVYtoI420(dst, srcW, srcH, srcY, srcU, srcV)
+                    dw, dh := s.outW, s.outH
+                    if dw%2 != 0 { dw-- }
+                    if dh%2 != 0 { dh-- }
+                    if dw < 2 { dw = 2 }; if dh < 2 { dh = 2 }
+                    dstY := make([]byte, dw*dh)
+                    dstU := make([]byte, (dw/2)*(dh/2))
+                    dstV := make([]byte, (dw/2)*(dh/2))
+                    I420Scale(srcY, srcU, srcV, srcW, srcH, dstY, dstU, dstV, dw, dh)
+                    out := make([]byte, dw*dh*4)
+                    I420ToBGRA(dstY, dstU, dstV, dw, dh, out)
+                    s.w, s.h = dw, dh
+                    s.pixfmt = "bgra"
+                    s.last.Store(out)
+                } else {
+                    s.w, s.h = srcW, srcH
+                    s.pixfmt = "uyvy422"
+                    s.last.Store(dst)
+                }
             }
         } else {
             // BGRA path
             if vf.Stride == vf.W*4 {
                 frame := make([]byte, len(vf.Data))
                 copy(frame, vf.Data)
-                s.w, s.h = vf.W, vf.H
-                s.pixfmt = "bgra"
-                s.last.Store(frame)
+                srcW, srcH := vf.W, vf.H
+                if s.outW > 0 && s.outH > 0 && (s.outW != srcW || s.outH != srcH) {
+                    // Convert -> scale -> back to BGRA
+                    srcY := make([]byte, srcW*srcH)
+                    srcU := make([]byte, (srcW/2)*(srcH/2))
+                    srcV := make([]byte, (srcW/2)*(srcH/2))
+                    BGRAtoI420(frame, srcW, srcH, srcY, srcU, srcV)
+                    dw, dh := s.outW, s.outH
+                    if dw%2 != 0 { dw-- }
+                    if dh%2 != 0 { dh-- }
+                    if dw < 2 { dw = 2 }; if dh < 2 { dh = 2 }
+                    dstY := make([]byte, dw*dh)
+                    dstU := make([]byte, (dw/2)*(dh/2))
+                    dstV := make([]byte, (dw/2)*(dh/2))
+                    I420Scale(srcY, srcU, srcV, srcW, srcH, dstY, dstU, dstV, dw, dh)
+                    out := make([]byte, dw*dh*4)
+                    I420ToBGRA(dstY, dstU, dstV, dw, dh, out)
+                    s.w, s.h = dw, dh
+                    s.pixfmt = "bgra"
+                    s.last.Store(out)
+                } else {
+                    s.w, s.h = srcW, srcH
+                    s.pixfmt = "bgra"
+                    s.last.Store(frame)
+                }
             } else {
                 w, h := vf.W, vf.H
                 dst := make([]byte, w*h*4)
@@ -109,9 +179,30 @@ func (s *NDISource) loop() {
                     dstOff := y*w*4
                     copy(dst[dstOff:dstOff+w*4], vf.Data[srcOff:srcOff+vf.Stride])
                 }
-                s.w, s.h = w, h
-                s.pixfmt = "bgra"
-                s.last.Store(dst)
+                srcW, srcH := w, h
+                if s.outW > 0 && s.outH > 0 && (s.outW != srcW || s.outH != srcH) {
+                    srcY := make([]byte, srcW*srcH)
+                    srcU := make([]byte, (srcW/2)*(srcH/2))
+                    srcV := make([]byte, (srcW/2)*(srcH/2))
+                    BGRAtoI420(dst, srcW, srcH, srcY, srcU, srcV)
+                    dw, dh := s.outW, s.outH
+                    if dw%2 != 0 { dw-- }
+                    if dh%2 != 0 { dh-- }
+                    if dw < 2 { dw = 2 }; if dh < 2 { dh = 2 }
+                    dstY := make([]byte, dw*dh)
+                    dstU := make([]byte, (dw/2)*(dh/2))
+                    dstV := make([]byte, (dw/2)*(dh/2))
+                    I420Scale(srcY, srcU, srcV, srcW, srcH, dstY, dstU, dstV, dw, dh)
+                    out := make([]byte, dw*dh*4)
+                    I420ToBGRA(dstY, dstU, dstV, dw, dh, out)
+                    s.w, s.h = dw, dh
+                    s.pixfmt = "bgra"
+                    s.last.Store(out)
+                } else {
+                    s.w, s.h = srcW, srcH
+                    s.pixfmt = "bgra"
+                    s.last.Store(dst)
+                }
             }
         }
         if !s.firstLogged {
@@ -149,6 +240,16 @@ func (s *NDISource) Stop() {
         close(s.quit)
         s.rx.Close()
     }
+}
+
+// SetOutputSize requests that the source rescale frames to the given size before handing to encoders.
+// Only effective when built with libyuv; otherwise frames remain at native size.
+func (s *NDISource) SetOutputSize(w, h int) {
+    if w%2 != 0 { w-- }
+    if h%2 != 0 { h-- }
+    if w < 2 { w = 2 }
+    if h < 2 { h = 2 }
+    s.outW, s.outH = w, h
 }
 
 // tiny error without importing fmt
