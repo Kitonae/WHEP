@@ -29,6 +29,22 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
+rem Auto-increment build number and prepare ldflags
+set "BUILD_FILE=%CD%\build-number.txt"
+if not exist "%BUILD_FILE%" (
+    echo 0> "%BUILD_FILE%"
+)
+set /p BUILD_NO=<"%BUILD_FILE%"
+if "%BUILD_NO%"=="" set "BUILD_NO=0"
+set /a BUILD_NO=%BUILD_NO%+1 >nul 2>&1
+echo %BUILD_NO%> "%BUILD_FILE%"
+
+rem Try to get current git commit (short)
+for /f "usebackq tokens=*" %%g in (`git rev-parse --short HEAD 2^>nul`) do set "GIT_COMMIT=%%g"
+if "%GIT_COMMIT%"=="" set "GIT_COMMIT=unknown"
+
+set "LDFLAGS=-X whep/internal/version.BuildNumber=%BUILD_NO% -X whep/internal/version.GitCommit=%GIT_COMMIT%"
+
 rem Set up paths
 set "NDI_SDK_DIR=C:\Program Files\NDI\NDI 6 SDK"
 set "NDI_INCLUDE=%NDI_SDK_DIR%\Include"
@@ -58,13 +74,18 @@ if not exist "%NDI_LIB64%\Processing.NDI.Lib.x64.lib" (
 )
 
 rem Check libvpx
-if not exist "%LIBVPX_PATH%\include\vpx\vpx_encoder.h" (
-    echo [WARN] libvpx headers not found at "%LIBVPX_PATH%\include\vpx\vpx_encoder.h"
-    echo       VP8 encoding will not be available
-    set "VPX_AVAILABLE=0"
-) else (
-    echo [✓] libvpx headers found
+set "VPX_AVAILABLE=0"
+if exist "%LIBVPX_PATH%\include\vpx\vpx_encoder.h" (
+    echo [✓] libvpx headers found under include
     set "VPX_AVAILABLE=1"
+    set "LIBVPX_INCLUDE=%LIBVPX_PATH%\include"
+) else if exist "%LIBVPX_PATH%\src\vpx\vpx_encoder.h" (
+    echo [✓] libvpx headers found under src
+    set "VPX_AVAILABLE=1"
+    set "LIBVPX_INCLUDE=%LIBVPX_PATH%\src"
+) else (
+    echo [WARN] libvpx headers not found at "%LIBVPX_PATH%\include\vpx\vpx_encoder.h" or "%LIBVPX_PATH%\src\vpx\vpx_encoder.h"
+    echo       VP8 encoding will not be available
 )
 
 set "VPX_LIB_OK=0"
@@ -131,8 +152,7 @@ for %%i in ("%NDI_INCLUDE%") do set "NDI_INCLUDE_SAFE=%%~si"
 for %%i in ("%NDI_LIB64%") do set "NDI_LIB64_SAFE=%%~si"
 for %%i in ("%LIBVPX_PATH%") do set "LIBVPX_PATH_SAFE=%%~si"
 
-rem Determine libvpx include dir: force using source headers to match built lib version
-set "LIBVPX_INCLUDE=%LIBVPX_PATH%\include"
+rem Determine libvpx include dir (include or src) based on earlier detection
 for %%i in ("%LIBVPX_INCLUDE%") do set "LIBVPX_INCLUDE_SAFE=%%~si"
 if "%LIBVPX_INCLUDE_SAFE%"=="" set "LIBVPX_INCLUDE_SAFE=%LIBVPX_INCLUDE%"
 for %%i in ("%LIBYUV_PATH%") do set "LIBYUV_PATH_SAFE=%%~si"
@@ -188,15 +208,15 @@ if "%VPX_AVAILABLE%"=="0" (
     echo [WARN] libvpx not available, building NDI-only version instead
     if "%YUV_AVAILABLE%"=="1" (
         echo [INFO] libyuv present, enabling yuv tag
-        go build -v -tags yuv -o whep.exe ./cmd/whep
+        go build -v -ldflags "%LDFLAGS%" -tags yuv -o whep.exe ./cmd/whep
     ) else (
-        go build -v -o whep.exe ./cmd/whep
+        go build -v -ldflags "%LDFLAGS%" -o whep.exe ./cmd/whep
     )
 ) else (
     if "%YUV_AVAILABLE%"=="1" (
-        go build -v -tags "vpx yuv" -o whep.exe ./cmd/whep
+        go build -v -ldflags "%LDFLAGS%" -tags "vpx yuv" -o whep.exe ./cmd/whep
     ) else (
-        go build -v -tags vpx -o whep.exe ./cmd/whep
+        go build -v -ldflags "%LDFLAGS%" -tags vpx -o whep.exe ./cmd/whep
     )
 )
 
@@ -222,7 +242,7 @@ if %ERRORLEVEL% equ 0 (
     echo ✗ Build failed with error level %ERRORLEVEL%
     if "%VPX_AVAILABLE%"=="1" (
         echo Attempting NDI-only build as fallback...
-        go build -v -o whep.exe ./cmd/whep
+        go build -v -ldflags "%LDFLAGS%" -o whep.exe ./cmd/whep
         if %ERRORLEVEL% equ 0 (
             echo ✓ Fallback build successful: whep.exe
             echo ✓ Features: NDI streaming only
